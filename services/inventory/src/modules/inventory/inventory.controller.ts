@@ -7,11 +7,14 @@ import type {
   CreateInventoryItemInput,
   FulfilStockInput,
   InventoryIdParams,
+  ListAuditLogsQuery,
   ListInventoryQuery,
   ListMovementsQuery,
   ReceiveStockInput,
   ReleaseStockInput,
   ReserveStockInput,
+  ReturnStockInput,
+  SellStockInput,
   SkuParams,
   UpdateInventoryItemInput,
 } from "./inventory.schema.js";
@@ -44,7 +47,18 @@ export class InventoryController {
 
   update = async (req: Request, res: Response): Promise<void> => {
     const { body, params } = validated<UpdateInventoryItemInput, unknown, InventoryIdParams>(req);
-    sendSuccess(res, await this.service.update(params.id, body));
+    const item = await this.service.update(params.id, body, req.actor);
+    req.log.info(
+      { itemId: item.id, fields: Object.keys(body), actor: req.actor ?? null },
+      "inventory_item_updated",
+    );
+    sendSuccess(res, item);
+  };
+
+  listAuditLogs = async (req: Request, res: Response): Promise<void> => {
+    const { params, query } = validated<unknown, ListAuditLogsQuery, InventoryIdParams>(req);
+    const { items, total } = await this.service.listAuditLogs(params.id, query);
+    sendPaginated(res, items, { page: query.page, limit: query.limit, total });
   };
 
   remove = async (req: Request, res: Response): Promise<void> => {
@@ -81,6 +95,26 @@ export class InventoryController {
     const { body, params } = validated<FulfilStockInput, unknown, InventoryIdParams>(req);
     const item = await this.service.fulfil(params.id, body);
     req.log.info({ itemId: item.id, quantity: body.quantity }, "stock_fulfilled");
+    sendSuccess(res, item);
+  };
+
+  sell = async (req: Request, res: Response): Promise<void> => {
+    const { body, params } = validated<SellStockInput, unknown, InventoryIdParams>(req);
+    const item = await this.service.sell(params.id, body);
+    req.log.info(
+      { itemId: item.id, quantity: body.quantity, reference: body.reference },
+      "stock_sold",
+    );
+    sendSuccess(res, item);
+  };
+
+  acceptReturn = async (req: Request, res: Response): Promise<void> => {
+    const { body, params } = validated<ReturnStockInput, unknown, InventoryIdParams>(req);
+    const item = await this.service.acceptReturn(params.id, body);
+    req.log.info(
+      { itemId: item.id, quantity: body.quantity, reference: body.reference },
+      "stock_returned",
+    );
     sendSuccess(res, item);
   };
 

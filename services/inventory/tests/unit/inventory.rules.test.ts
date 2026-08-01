@@ -9,6 +9,7 @@ import {
   planReceipt,
   planRelease,
   planReservation,
+  planSale,
 } from "../../src/modules/inventory/inventory.rules.js";
 
 describe("inventory rules", () => {
@@ -73,6 +74,26 @@ describe("inventory rules", () => {
 
     it("refuses to ship unreserved stock", () => {
       expect(() => planFulfilment({ quantity: 100, reserved: 5 }, 10)).toThrowError(ConflictError);
+    });
+  });
+
+  describe("planSale", () => {
+    it("removes unreserved stock from on-hand", () => {
+      expect(planSale({ quantity: 100, reserved: 20 }, 30)).toEqual({
+        quantity: 70,
+        reserved: 20,
+      });
+    });
+
+    it("refuses to eat into stock reserved for other orders", () => {
+      expect(() => planSale({ quantity: 100, reserved: 95 }, 10)).toThrowError(ConflictError);
+    });
+
+    it("allows selling exactly what is available", () => {
+      expect(planSale({ quantity: 100, reserved: 90 }, 10)).toEqual({
+        quantity: 90,
+        reserved: 90,
+      });
     });
   });
 

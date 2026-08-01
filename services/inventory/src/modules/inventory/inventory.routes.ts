@@ -7,11 +7,14 @@ import {
   createInventoryItemSchema,
   fulfilStockSchema,
   inventoryIdParamsSchema,
+  listAuditLogsQuerySchema,
   listInventoryQuerySchema,
   listMovementsQuerySchema,
   receiveStockSchema,
   releaseStockSchema,
   reserveStockSchema,
+  returnStockSchema,
+  sellStockSchema,
   skuParamsSchema,
   updateInventoryItemSchema,
 } from "./inventory.schema.js";
@@ -38,6 +41,12 @@ export function createInventoryRouter(controller: InventoryController): Router {
   );
 
   router.get(
+    "/:id/audit-logs",
+    validate({ params: inventoryIdParamsSchema, query: listAuditLogsQuerySchema }),
+    asyncHandler(controller.listAuditLogs),
+  );
+
+  router.get(
     "/:id/movements",
     validate({ params: inventoryIdParamsSchema, query: listMovementsQuerySchema }),
     asyncHandler(controller.listMovements),
@@ -59,6 +68,16 @@ export function createInventoryRouter(controller: InventoryController): Router {
     "/:id/fulfil",
     validate({ params: inventoryIdParamsSchema, body: fulfilStockSchema }),
     asyncHandler(controller.fulfil),
+  );
+  router.post(
+    "/:id/sell",
+    validate({ params: inventoryIdParamsSchema, body: sellStockSchema }),
+    asyncHandler(controller.sell),
+  );
+  router.post(
+    "/:id/return",
+    validate({ params: inventoryIdParamsSchema, body: returnStockSchema }),
+    asyncHandler(controller.acceptReturn),
   );
   router.post(
     "/:id/receive",

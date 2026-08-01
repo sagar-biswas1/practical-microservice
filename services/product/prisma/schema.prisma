@@ -28,6 +28,7 @@ model Product {
   priceCents  Int           @map("price_cents")
   currency    String        @default("USD") @db.Char(3)
   status      ProductStatus @default(DRAFT)
+  inventoryId String        @map("inventory_id") @db.Uuid
   createdAt   DateTime      @default(now()) @map("created_at")
   updatedAt   DateTime      @updatedAt @map("updated_at")
 

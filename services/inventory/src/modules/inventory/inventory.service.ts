@@ -7,23 +7,28 @@ import {
   planReceipt,
   planRelease,
   planReservation,
+  planSale,
   assertInvariants,
 } from "./inventory.rules.js";
 import type {
+  InventoryAuditLog,
   InventoryItem,
   InventoryRepository,
   Paginated,
-  StockMovement,
+  StockMovementHistory,
 } from "./inventory.repository.js";
 import type {
   AdjustStockInput,
   CreateInventoryItemInput,
   FulfilStockInput,
+  ListAuditLogsQuery,
   ListInventoryQuery,
   ListMovementsQuery,
   ReceiveStockInput,
   ReleaseStockInput,
   ReserveStockInput,
+  ReturnStockInput,
+  SellStockInput,
   StockMovementTypeValue,
   UpdateInventoryItemInput,
 } from "./inventory.schema.js";
@@ -70,9 +75,27 @@ export class InventoryService {
     return toInventoryItemView(await this.repository.create(input));
   }
 
-  async update(id: string, input: UpdateInventoryItemInput): Promise<InventoryItemView> {
-    await this.getById(id);
-    return toInventoryItemView(await this.repository.update(id, input));
+  /**
+   * Patches any column and records who changed what. The 404 and the
+   * invariant check both happen inside the repository transaction, so a
+   * concurrent reservation cannot slip between the check and the write.
+   */
+  async update(
+    id: string,
+    input: UpdateInventoryItemInput,
+    actor?: string,
+  ): Promise<InventoryItemView> {
+    const updated = await this.repository.update(id, input, {
+      actor,
+      validate: (current) => {
+        // A hand-edited quantity must still cover what is already promised.
+        if (input.quantity !== undefined) {
+          assertInvariants({ quantity: input.quantity, reserved: current.reserved });
+        }
+      },
+    });
+
+    return toInventoryItemView(updated);
   }
 
   async remove(id: string): Promise<void> {
@@ -88,9 +111,18 @@ export class InventoryService {
   async listMovements(
     id: string,
     query: ListMovementsQuery,
-  ): Promise<Paginated<StockMovement>> {
+  ): Promise<Paginated<StockMovementHistory>> {
     await this.getById(id);
     return this.repository.listMovements(id, query);
+  }
+
+  /** Who changed which field, and from what to what. */
+  async listAuditLogs(
+    id: string,
+    query: ListAuditLogsQuery,
+  ): Promise<Paginated<InventoryAuditLog>> {
+    await this.getById(id);
+    return this.repository.listAuditLogs(id, query);
   }
 
   /** Promise stock to an order without shipping it yet. */
@@ -114,9 +146,32 @@ export class InventoryService {
     );
   }
 
+  /**
+   * Sell stock that was never reserved — a walk-in or single-step checkout.
+   * Recorded as OUTBOUND, same as a fulfilment: physically, goods left.
+   * Two-step order flows should still go reserve → fulfil so the units are
+   * held while payment settles.
+   */
+  sell(id: string, input: SellStockInput): Promise<InventoryItemView> {
+    return this.applyChange(id, "OUTBOUND", input.quantity, input, (item) =>
+      planSale(item, input.quantity),
+    );
+  }
+
   /** Book in a delivery. */
   receive(id: string, input: ReceiveStockInput): Promise<InventoryItemView> {
     return this.applyChange(id, "INBOUND", input.quantity, input, (item) =>
+      planReceipt(item, input.quantity),
+    );
+  }
+
+  /**
+   * Take back sold units. The level change is identical to a delivery; only
+   * the ledger entry differs, so returned goods can be separated from
+   * purchased ones when reading the history.
+   */
+  acceptReturn(id: string, input: ReturnStockInput): Promise<InventoryItemView> {
+    return this.applyChange(id, "RETURN", input.quantity, input, (item) =>
       planReceipt(item, input.quantity),
     );
   }

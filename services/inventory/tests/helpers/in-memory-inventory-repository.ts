@@ -1,14 +1,18 @@
 import { randomUUID } from "node:crypto";
 import type {
+  InventoryAuditLog,
   InventoryItem,
   InventoryRepository,
   Paginated,
   StockChangePlanner,
-  StockMovement,
+  StockMovementHistory,
+  UpdateContext,
 } from "../../src/modules/inventory/inventory.repository.js";
+import { diffInventoryItem } from "../../src/modules/inventory/inventory.repository.js";
 import { NotFoundError } from "../../src/errors/app-error.js";
 import type {
   CreateInventoryItemInput,
+  ListAuditLogsQuery,
   ListInventoryQuery,
   ListMovementsQuery,
   UpdateInventoryItemInput,
@@ -21,7 +25,8 @@ import type {
  */
 export class InMemoryInventoryRepository implements InventoryRepository {
   private readonly items = new Map<string, InventoryItem>();
-  private readonly movements: StockMovement[] = [];
+  private readonly movements: StockMovementHistory[] = [];
+  private readonly auditLogs: InventoryAuditLog[] = [];
 
   constructor(seed: InventoryItem[] = []) {
     for (const item of seed) this.items.set(item.id, item);
@@ -80,16 +85,50 @@ export class InMemoryInventoryRepository implements InventoryRepository {
     const item = InMemoryInventoryRepository.buildItem({ ...input, id: randomUUID(), reserved: 0 });
     this.items.set(item.id, item);
     if (item.quantity > 0) {
-      this.recordMovement(item.id, "INBOUND", item.quantity, "Initial stock");
+      // Opening stock: nothing was on hand before it.
+      this.recordMovement(item.id, "INBOUND", item.quantity, 0, "Initial stock");
     }
     return item;
   }
 
-  async update(id: string, input: UpdateInventoryItemInput): Promise<InventoryItem> {
+  async update(
+    id: string,
+    input: UpdateInventoryItemInput,
+    context: UpdateContext,
+  ): Promise<InventoryItem> {
     const current = this.items.get(id);
     if (!current) throw new NotFoundError(`Inventory item '${id}' was not found`);
+
+    context.validate(current);
+
+    const changes = diffInventoryItem(current, input);
+    if (changes.length === 0) return current;
+
     const updated: InventoryItem = { ...current, ...input, updatedAt: new Date() };
     this.items.set(id, updated);
+
+    for (const change of changes) {
+      this.auditLogs.push({
+        id: randomUUID(),
+        itemId: id,
+        field: change.field,
+        oldValue: change.oldValue,
+        newValue: change.newValue,
+        actor: context.actor ?? null,
+        createdAt: new Date(),
+      });
+    }
+
+    if (updated.quantity !== current.quantity) {
+      this.recordMovement(
+        id,
+        "ADJUSTMENT",
+        Math.abs(updated.quantity - current.quantity),
+        current.quantity,
+        `Patched by ${context.actor ?? "unknown"}`,
+      );
+    }
+
     return updated;
   }
 
@@ -100,13 +139,26 @@ export class InMemoryInventoryRepository implements InventoryRepository {
   async listMovements(
     itemId: string,
     query: ListMovementsQuery,
-  ): Promise<Paginated<StockMovement>> {
+  ): Promise<Paginated<StockMovementHistory>> {
     let movements = this.movements.filter((movement) => movement.itemId === itemId);
     if (query.type) movements = movements.filter((movement) => movement.type === query.type);
 
     const total = movements.length;
     const start = (query.page - 1) * query.limit;
     return { items: movements.slice(start, start + query.limit), total };
+  }
+
+  async listAuditLogs(
+    itemId: string,
+    query: ListAuditLogsQuery,
+  ): Promise<Paginated<InventoryAuditLog>> {
+    let logs = this.auditLogs.filter((log) => log.itemId === itemId);
+    if (query.field) logs = logs.filter((log) => log.field === query.field);
+    if (query.actor) logs = logs.filter((log) => log.actor === query.actor);
+
+    const total = logs.length;
+    const start = (query.page - 1) * query.limit;
+    return { items: logs.slice(start, start + query.limit), total };
   }
 
   async applyStockChange(id: string, plan: StockChangePlanner): Promise<InventoryItem> {
@@ -126,6 +178,7 @@ export class InMemoryInventoryRepository implements InventoryRepository {
       id,
       next.movement.type,
       next.movement.quantity,
+      current.quantity,
       next.movement.reason ?? null,
       next.movement.reference ?? null,
     );
@@ -133,10 +186,12 @@ export class InMemoryInventoryRepository implements InventoryRepository {
     return updated;
   }
 
+  /** `lastQuantity` is the on-hand level *before* the movement was applied. */
   private recordMovement(
     itemId: string,
-    type: StockMovement["type"],
-    quantity: number,
+    type: StockMovementHistory["type"],
+    quantityChanged: number,
+    lastQuantity: number,
     reason: string | null = null,
     reference: string | null = null,
   ): void {
@@ -144,7 +199,8 @@ export class InMemoryInventoryRepository implements InventoryRepository {
       id: randomUUID(),
       itemId,
       type,
-      quantity,
+      quantityChanged,
+      lastQuantity,
       reason,
       reference,
       createdAt: new Date(),
@@ -157,5 +213,9 @@ export class InMemoryInventoryRepository implements InventoryRepository {
 
   get movementCount(): number {
     return this.movements.length;
+  }
+
+  get auditLogCount(): number {
+    return this.auditLogs.length;
   }
 }

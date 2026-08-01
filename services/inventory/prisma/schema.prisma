@@ -19,15 +19,20 @@ datasource db {
 }
 
 enum StockMovementType {
+  /// Supplier delivery / restock.
   INBOUND
+  /// Stock leaving on a sale, whether or not it was reserved first.
   OUTBOUND
   RESERVATION
   RELEASE
+  /// Customer return — units come back on the shelf. Kept distinct from
+  /// INBOUND so sales returns can be told apart from purchasing in reporting.
+  RETURN
   ADJUSTMENT
 }
 
 model InventoryItem {
-  id           String   @id @default(uuid()) @db.Uuid
+  id           String   @id @default(cuid()) @db.Uuid
   sku          String   @unique @db.VarChar(64)
   productId    String   @map("product_id") @db.Uuid
   warehouse    String   @default("default") @db.VarChar(64)
@@ -39,25 +44,47 @@ model InventoryItem {
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
-  movements StockMovement[]
+  movementHistories StockMovementHistory[]
+  auditLogs         InventoryAuditLog[]
 
   @@index([productId])
   @@index([warehouse])
   @@map("inventory_items")
 }
 
-model StockMovement {
-  id        String            @id @default(uuid()) @db.Uuid
+/// Field-level change trail for edits made through PATCH. Separate from
+/// StockMovementHistory on purpose: that table is a stock ledger where every
+/// row must be a real movement, whereas this one answers "who changed what,
+/// and from what to what" for any column — including ones that move no stock.
+model InventoryAuditLog {
+  id        String        @id @default(uuid()) @db.Uuid
+  itemId    String        @map("item_id") @db.Uuid
+  item      InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  field     String        @db.VarChar(64)
+  /// Rendered as text so one table can log any column type.
+  oldValue  String?       @map("old_value") @db.VarChar(200)
+  newValue  String?       @map("new_value") @db.VarChar(200)
+  /// Who made the change, propagated by the gateway. Null = unattributed.
+  actor     String?       @db.VarChar(120)
+  createdAt DateTime      @default(now()) @map("created_at")
+
+  @@index([itemId, createdAt])
+  @@map("inventory_audit_logs")
+}
+
+model StockMovementHistory {
+  id        String            @id @default(cuid()) @db.Uuid
   itemId    String            @map("item_id") @db.Uuid
   item      InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
   type      StockMovementType
   /// Always positive; `type` carries the direction.
-  quantity  Int
+  quantityChanged Int           @map("quantity_changed")
+  lastQuantity Int           @map("last_quantity")
   reason    String?           @db.VarChar(500)
   /// Correlation handle for the originating order/shipment.
   reference String?           @map("reference") @db.VarChar(120)
   createdAt DateTime          @default(now()) @map("created_at")
 
   @@index([itemId, createdAt])
-  @@map("stock_movements")
+  @@map("stock_movement_histories")
 }

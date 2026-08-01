@@ -1,13 +1,10 @@
 import { z } from "zod";
+import { StockMovementType } from "../../generated/prisma/enums.js";
 
-export const STOCK_MOVEMENT_TYPES = [
-  "INBOUND",
-  "OUTBOUND",
-  "RESERVATION",
-  "RELEASE",
-  "ADJUSTMENT",
-] as const;
-export type StockMovementTypeValue = (typeof STOCK_MOVEMENT_TYPES)[number];
+// Sourced from the generated enum rather than re-typed: renaming a member in
+// schema.prisma then becomes a compile error here instead of a 400 at runtime.
+export const STOCK_MOVEMENT_TYPES = StockMovementType;
+export type StockMovementTypeValue = StockMovementType;
 
 export const INVENTORY_SORT_FIELDS = ["createdAt", "sku", "quantity"] as const;
 
@@ -37,15 +34,32 @@ const inventoryFieldsSchema = z.strictObject({
   reorderLevel: z.number().int().nonnegative().max(1_000_000_000),
 });
 
+/**
+ * Columns the audit trail covers — by construction, exactly the patchable
+ * set, so a field added above cannot be silently left untracked.
+ */
+export const AUDITED_FIELDS = Object.keys(inventoryFieldsSchema.shape) as [
+  InventoryFieldName,
+  ...InventoryFieldName[],
+];
+export type InventoryFieldName = keyof typeof inventoryFieldsSchema.shape;
+
 export const createInventoryItemSchema = inventoryFieldsSchema.extend({
   warehouse: inventoryFieldsSchema.shape.warehouse.default("default"),
   quantity: inventoryFieldsSchema.shape.quantity.default(0),
   reorderLevel: inventoryFieldsSchema.shape.reorderLevel.default(0),
 });
 
-/** `sku` and `productId` are immutable — rebinding them would orphan history. */
+/**
+ * Every column is patchable. Each accepted field is diffed against the stored
+ * row and written to the audit log, and a `quantity` edit additionally lands
+ * in the stock ledger as an ADJUSTMENT.
+ *
+ * `reserved` is deliberately absent: those units are promises made to open
+ * orders, and the reservation endpoints are the only thing allowed to move
+ * that counter. Editing it by hand would silently break outstanding orders.
+ */
 export const updateInventoryItemSchema = inventoryFieldsSchema
-  .pick({ warehouse: true, reorderLevel: true })
   .partial()
   .refine((data) => Object.values(data).some((value) => value !== undefined), {
     message: "At least one field must be provided",
@@ -71,6 +85,23 @@ export const releaseStockSchema = reserveStockSchema;
 export const fulfilStockSchema = reserveStockSchema;
 
 export const receiveStockSchema = reserveStockSchema;
+
+/**
+ * Sales and returns cross a service boundary, so the order reference is
+ * mandatory: without it the ledger cannot be reconciled against the order
+ * service, and a duplicated sale event is impossible to spot after the fact.
+ */
+export const sellStockSchema = z.strictObject({
+  quantity: positiveQuantity,
+  reason,
+  reference: z
+    .string()
+    .trim()
+    .min(1, "A sale must reference its order")
+    .max(120),
+});
+
+export const returnStockSchema = sellStockSchema;
 
 /** A signed correction; negative values reduce on-hand stock. */
 export const adjustStockSchema = z.strictObject({
@@ -99,6 +130,14 @@ export const listInventoryQuerySchema = z.object({
   order: z.enum(["asc", "desc"]).default("desc"),
 });
 
+export const listAuditLogsQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  /** Narrow the trail to a single column, e.g. `?field=reorderLevel`. */
+  field: z.enum(AUDITED_FIELDS).optional(),
+  actor: z.string().trim().min(1).max(120).optional(),
+});
+
 export const listMovementsQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
@@ -111,8 +150,11 @@ export type ReserveStockInput = z.infer<typeof reserveStockSchema>;
 export type ReleaseStockInput = z.infer<typeof releaseStockSchema>;
 export type FulfilStockInput = z.infer<typeof fulfilStockSchema>;
 export type ReceiveStockInput = z.infer<typeof receiveStockSchema>;
+export type SellStockInput = z.infer<typeof sellStockSchema>;
+export type ReturnStockInput = z.infer<typeof returnStockSchema>;
 export type AdjustStockInput = z.infer<typeof adjustStockSchema>;
 export type ListInventoryQuery = z.infer<typeof listInventoryQuerySchema>;
+export type ListAuditLogsQuery = z.infer<typeof listAuditLogsQuerySchema>;
 export type ListMovementsQuery = z.infer<typeof listMovementsQuerySchema>;
 export type InventoryIdParams = z.infer<typeof inventoryIdParamsSchema>;
 export type SkuParams = z.infer<typeof skuParamsSchema>;

@@ -62,6 +62,22 @@ export function planFulfilment(item: StockLevels, quantity: number): StockLevels
   return { quantity: item.quantity - quantity, reserved: item.reserved - quantity };
 }
 
+/**
+ * An over-the-counter sale: stock leaves without ever having been reserved.
+ * Reserved units are promised to other orders, so a walk-in sale may only
+ * consume what is *available*, not the full on-hand count.
+ */
+export function planSale(item: StockLevels, quantity: number): StockLevels {
+  const available = availableStock(item);
+  if (quantity > available) {
+    throw new ConflictError(
+      `Insufficient stock: requested ${quantity}, only ${available} available`,
+    );
+  }
+  return { quantity: item.quantity - quantity, reserved: item.reserved };
+}
+
+/** Adds units to on-hand stock: a supplier delivery or a customer return. */
 export function planReceipt(item: StockLevels, quantity: number): StockLevels {
   return { quantity: item.quantity + quantity, reserved: item.reserved };
 }

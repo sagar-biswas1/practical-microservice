@@ -7,6 +7,8 @@ declare global {
       id: string;
       /** Request-scoped child logger, pre-tagged with the correlation id. */
       log: Logger;
+      /** Authenticated caller from `x-actor-id`; absent when unattributed. */
+      actor?: string;
       /** Payloads that passed Zod validation. Populated by the `validate` middleware. */
       validated: {
         body?: unknown;

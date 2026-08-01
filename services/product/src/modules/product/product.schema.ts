@@ -22,7 +22,10 @@ const productFieldsSchema = z.strictObject({
     .trim()
     .min(3, "SKU must be at least 3 characters")
     .max(64)
-    .regex(/^[A-Za-z0-9._-]+$/, "SKU may only contain letters, digits, '.', '_' and '-'")
+    .regex(
+      /^[A-Za-z0-9._-]+$/,
+      "SKU may only contain letters, digits, '.', '_' and '-'",
+    )
     .transform((value) => value.toUpperCase()),
   name: z.string().trim().min(1, "Name is required").max(200),
   description: z.string().trim().max(5000).optional(),
@@ -37,6 +40,7 @@ const productFieldsSchema = z.strictObject({
     .length(3, "Currency must be a 3-letter ISO 4217 code")
     .transform((value) => value.toUpperCase()),
   status: z.enum(PRODUCT_STATUSES),
+  inventoryId: z.uuid("Inventory id must be a valid UUID"),
 });
 
 export const createProductSchema = productFieldsSchema.extend({

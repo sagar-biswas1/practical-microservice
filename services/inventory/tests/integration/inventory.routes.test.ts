@@ -69,6 +69,76 @@ describe("inventory API", () => {
     });
   });
 
+  describe("PATCH /inventory/:id", () => {
+    let itemId: string;
+
+    beforeEach(() => {
+      const item = InMemoryInventoryRepository.buildItem({
+        quantity: 100,
+        reserved: 0,
+        warehouse: "default",
+        reorderLevel: 10,
+      });
+      itemId = item.id;
+      ({ app } = buildApp(new InMemoryInventoryRepository([item])));
+    });
+
+    it("attributes the change to the x-actor-id header", async () => {
+      await request(app)
+        .patch(`${BASE}/${itemId}`)
+        .set("x-actor-id", "ops@example.com")
+        .send({ warehouse: "north" })
+        .expect(200);
+
+      const response = await request(app).get(`${BASE}/${itemId}/audit-logs`).expect(200);
+
+      expect(response.body.meta.total).toBe(1);
+      expect(response.body.data[0]).toMatchObject({
+        field: "warehouse",
+        oldValue: "default",
+        newValue: "north",
+        actor: "ops@example.com",
+      });
+    });
+
+    it("patches quantity and mirrors it into the movement history", async () => {
+      const response = await request(app)
+        .patch(`${BASE}/${itemId}`)
+        .set("x-actor-id", "ops@example.com")
+        .send({ quantity: 60 })
+        .expect(200);
+
+      expect(response.body.data).toMatchObject({ quantity: 60, available: 60 });
+
+      const movements = await request(app)
+        .get(`${BASE}/${itemId}/movements?type=ADJUSTMENT`)
+        .expect(200);
+
+      expect(movements.body.meta.total).toBe(1);
+    });
+
+    it("returns 409 when the new quantity is below reserved units", async () => {
+      await request(app).post(`${BASE}/${itemId}/reserve`).send({ quantity: 70 }).expect(200);
+
+      await request(app).patch(`${BASE}/${itemId}`).send({ quantity: 50 }).expect(409);
+    });
+
+    it("rejects an empty patch", async () => {
+      await request(app).patch(`${BASE}/${itemId}`).send({}).expect(422);
+    });
+
+    it("rejects an unknown field", async () => {
+      await request(app).patch(`${BASE}/${itemId}`).send({ reserved: 5 }).expect(422);
+    });
+
+    it("404s for an unknown item", async () => {
+      await request(app)
+        .patch(`${BASE}/2c9e6679-7425-40de-944b-e07fc1f90ae8`)
+        .send({ warehouse: "north" })
+        .expect(404);
+    });
+  });
+
   describe("stock transitions", () => {
     let itemId: string;
     let repository: InMemoryInventoryRepository;
@@ -123,6 +193,48 @@ describe("inventory API", () => {
         .expect(200);
 
       expect(response.body.data).toMatchObject({ reserved: 15, available: 85 });
+    });
+
+    it("sells stock straight off the shelf", async () => {
+      const response = await request(app)
+        .post(`${BASE}/${itemId}/sell`)
+        .send({ quantity: 30, reference: "ORDER-8" })
+        .expect(200);
+
+      expect(response.body.data).toMatchObject({ quantity: 70, reserved: 0, available: 70 });
+    });
+
+    it("requires an order reference on a sale", async () => {
+      await request(app).post(`${BASE}/${itemId}/sell`).send({ quantity: 5 }).expect(422);
+    });
+
+    it("returns 409 when a sale exceeds available stock", async () => {
+      await request(app).post(`${BASE}/${itemId}/reserve`).send({ quantity: 95 }).expect(200);
+
+      await request(app)
+        .post(`${BASE}/${itemId}/sell`)
+        .send({ quantity: 10, reference: "ORDER-9" })
+        .expect(409);
+    });
+
+    it("puts a customer return back into stock", async () => {
+      await request(app)
+        .post(`${BASE}/${itemId}/sell`)
+        .send({ quantity: 30, reference: "ORDER-10" })
+        .expect(200);
+
+      const response = await request(app)
+        .post(`${BASE}/${itemId}/return`)
+        .send({ quantity: 10, reference: "ORDER-10" })
+        .expect(200);
+
+      expect(response.body.data).toMatchObject({ quantity: 80, available: 80 });
+
+      const history = await request(app)
+        .get(`${BASE}/${itemId}/movements?type=RETURN`)
+        .expect(200);
+
+      expect(history.body.meta.total).toBe(1);
     });
 
     it("receives a delivery", async () => {
