@@ -1,0 +1,63 @@
+// Inventory service owns this schema exclusively.
+// Database-per-service is emulated with a dedicated Postgres schema:
+// DATABASE_URL=postgresql://.../db?schema=inventory
+//
+// Note: `productId` is a soft reference to the product service. There is
+// deliberately NO foreign key across a service boundary — consistency between
+// services is eventual, enforced by events/compensation, not by the database.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+  runtime      = "nodejs"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum StockMovementType {
+  INBOUND
+  OUTBOUND
+  RESERVATION
+  RELEASE
+  ADJUSTMENT
+}
+
+model InventoryItem {
+  id           String   @id @default(uuid()) @db.Uuid
+  sku          String   @unique @db.VarChar(64)
+  productId    String   @map("product_id") @db.Uuid
+  warehouse    String   @default("default") @db.VarChar(64)
+  /// Total units physically on hand, including reserved units.
+  quantity     Int      @default(0)
+  /// Units promised to open orders. Available = quantity - reserved.
+  reserved     Int      @default(0)
+  reorderLevel Int      @default(0) @map("reorder_level")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  movements StockMovement[]
+
+  @@index([productId])
+  @@index([warehouse])
+  @@map("inventory_items")
+}
+
+model StockMovement {
+  id        String            @id @default(uuid()) @db.Uuid
+  itemId    String            @map("item_id") @db.Uuid
+  item      InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  type      StockMovementType
+  /// Always positive; `type` carries the direction.
+  quantity  Int
+  reason    String?           @db.VarChar(500)
+  /// Correlation handle for the originating order/shipment.
+  reference String?           @map("reference") @db.VarChar(120)
+  createdAt DateTime          @default(now()) @map("created_at")
+
+  @@index([itemId, createdAt])
+  @@map("stock_movements")
+}

@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# prisma generated client (regenerated via `pnpm db:generate`)
+**/src/generated/
+
+# env — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# test / coverage
+coverage/
+.vitest/
+
+# logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

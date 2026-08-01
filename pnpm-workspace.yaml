@@ -1,0 +1,9 @@
+packages:
+  - "services/*"
+  - "api-gateway"
+
+onlyBuiltDependencies:
+  - "@prisma/client"
+  - "@prisma/engines"
+  - "esbuild"
+  - "prisma"

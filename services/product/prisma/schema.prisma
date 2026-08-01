@@ -1,0 +1,37 @@
+// Product service owns this schema exclusively.
+// Database-per-service is emulated with a dedicated Postgres schema:
+// DATABASE_URL=postgresql://.../db?schema=product
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+  runtime      = "nodejs"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+model Product {
+  id          String        @id @default(uuid()) @db.Uuid
+  sku         String        @unique @db.VarChar(64)
+  name        String        @db.VarChar(200)
+  description String?       @db.Text
+  priceCents  Int           @map("price_cents")
+  currency    String        @default("USD") @db.Char(3)
+  status      ProductStatus @default(DRAFT)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("products")
+}

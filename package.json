@@ -1,0 +1,22 @@
+{
+  "name": "practical-microservice",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Practical microservices playground: product + inventory services",
+  "packageManager": "pnpm@10.13.1",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "build": "pnpm -r build",
+    "start": "pnpm -r --parallel start",
+    "test": "pnpm -r test",
+    "test:watch": "pnpm -r --parallel test:watch",
+    "typecheck": "pnpm -r typecheck",
+    "db:generate": "pnpm -r db:generate",
+    "db:migrate": "pnpm -r db:migrate",
+    "db:push": "pnpm -r db:push",
+    "clean": "pnpm -r exec rm -rf dist node_modules/.cache && rm -rf node_modules"
+  }
+}
