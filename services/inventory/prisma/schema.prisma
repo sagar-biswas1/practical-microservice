@@ -13,9 +13,15 @@ generator client {
   runtime      = "nodejs"
 }
 
+// `url` is the pooled endpoint the running service uses. `directUrl` is the
+// unpooled one, used only by migrate/introspect: the migration engine needs a
+// stable session (its `search_path` sets the schema above, and it creates a
+// shadow database), and a transaction pooler hands out a different backend
+// mid-run, which loses both.
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 enum StockMovementType {

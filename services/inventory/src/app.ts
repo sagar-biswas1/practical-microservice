@@ -4,9 +4,16 @@ import helmet from "helmet";
 import { corsOrigins, env } from "./config/env.js";
 import { errorHandler } from "./middlewares/error-handler.js";
 import { notFoundHandler } from "./middlewares/not-found-handler.js";
-import { requestContext, REQUEST_ID_HEADER } from "./middlewares/request-context.js";
+import {
+  requestContext,
+  REQUEST_ID_HEADER,
+} from "./middlewares/request-context.js";
 import { requestLogger } from "./middlewares/request-logger.js";
-import { API_PREFIX, createApiRouter, type RouterDependencies } from "./routes/index.js";
+import {
+  API_PREFIX,
+  createApiRouter,
+  type RouterDependencies,
+} from "./routes/index.js";
 
 export type AppDependencies = RouterDependencies;
 
@@ -32,6 +39,17 @@ export function createApp(deps: AppDependencies): Express {
     }),
   );
 
+  app.use((req, res, next) => {
+    const protocol = req.headers["x-forwarded-proto"] || "http";
+    const host = req.headers["x-forwarded-host"];
+    const fullUrl = `${protocol}://${host}`;
+    if (Array.isArray(corsOrigins) && corsOrigins.includes(fullUrl)) {
+      next();
+    } else {
+      res.status(403).json({ error: "Forbidden" });
+    }
+  });
+
   // Before the body parsers: a malformed-JSON error must still carry a
   // correlation id and show up in the access log.
   app.use(requestContext);
@@ -43,7 +61,11 @@ export function createApp(deps: AppDependencies): Express {
   app.get("/", (_req, res) => {
     res.json({
       success: true,
-      data: { service: env.SERVICE_NAME, version: "1.0.0", apiPrefix: API_PREFIX },
+      data: {
+        service: env.SERVICE_NAME,
+        version: "1.0.0",
+        apiPrefix: API_PREFIX,
+      },
     });
   });
 

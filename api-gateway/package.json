@@ -1,0 +1,41 @@
+{
+  "name": "api-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Edge gateway: single entry point in front of the product and inventory services",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.6.1",
+    "helmet": "^8.1.0",
+    "http-proxy-middleware": "^3.0.7",
+    "morgan": "^1.10.1",
+    "pino": "^9.7.0",
+    "zod": "^4.0.14"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/morgan": "^1.9.10",
+    "@types/node": "^24.1.0",
+    "@types/supertest": "^6.0.3",
+    "@vitest/coverage-v8": "^3.2.4",
+    "pino-pretty": "^13.1.1",
+    "supertest": "^7.1.4",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

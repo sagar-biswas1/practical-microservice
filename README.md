@@ -1,34 +1,40 @@
 # practical-microservice
 
-A pnpm workspace with two independent HTTP services built on TypeScript, Express 5, Prisma 6
-(PostgreSQL), and Zod 4.
+A pnpm workspace with two independent HTTP services behind an edge gateway, built on
+TypeScript, Express 5, Prisma 6 (PostgreSQL), and Zod 4.
 
-| Service     | Port   | Owns                                   | Base path                      |
-| ----------- | ------ | -------------------------------------- | ------------------------------ |
-| `product`   | `4001` | Product catalogue                      | `http://localhost:4001/api/v1` |
-| `inventory` | `4002` | Stock levels + audited stock movements | `http://localhost:4002/api/v1` |
+| Package       | Port   | Owns                                   | Base path                      |
+| ------------- | ------ | -------------------------------------- | ------------------------------ |
+| `api-gateway` | `4000` | Single public entry point (stateless)  | `http://localhost:4000/api/v1` |
+| `product`     | `4001` | Product catalogue                      | `http://localhost:4001/api/v1` |
+| `inventory`   | `4002` | Stock levels + audited stock movements | `http://localhost:4002/api/v1` |
 
 The product service calls the inventory service over HTTP — it provisions a stock record for
 every product it creates and enriches its reads with stock levels. See
 [Cross-service composition](#cross-service-composition). The inventory service calls nobody.
+
+Clients talk to the gateway, which forwards `/api/v1/products` and `/api/v1/inventory` to the
+service that owns them. See [API gateway](#api-gateway). The services still listen on their own
+ports, so they can be exercised directly in development.
 
 ## Quick start
 
 ```bash
 pnpm install
 
-# Each service reads services/<name>/.env, falling back to the repo-root .env.
+# Each package reads its own .env, falling back to the repo-root .env.
 cp services/product/.env.example   services/product/.env
 cp services/inventory/.env.example services/inventory/.env
+cp api-gateway/.env.example        api-gateway/.env
 
 pnpm db:generate     # generate both Prisma clients (required before typecheck/build)
 pnpm db:migrate      # create tables — see "Database layout" first
-pnpm dev             # run both services concurrently
+pnpm dev             # run the gateway and both services concurrently
 ```
 
 Root scripts (`dev`, `build`, `start`, `test`, `typecheck`, `db:generate`, `db:migrate`,
-`db:push`) fan out to every workspace package via `pnpm -r`. Run one service on its own with
-`pnpm --filter @services/product <script>`.
+`db:push`) fan out to every workspace package via `pnpm -r`. Run one package on its own with
+`pnpm --filter @services/product <script>` or `pnpm --filter api-gateway <script>`.
 
 ## Database layout
 
@@ -82,6 +88,29 @@ services/<name>/
     ├── unit/                   # domain rules and services, no HTTP
     ├── integration/            # full middleware stack via supertest
     └── helpers/                # in-memory repository + service-client fakes
+```
+
+The gateway follows the same conventions — same env loading, logger, error envelope, and
+correlation id — minus everything to do with persistence. It has no Prisma, no modules, and no
+domain layer, because it owns no data:
+
+```
+api-gateway/
+├── src/
+│   ├── server.ts               # entry point: listen + graceful shutdown
+│   ├── app.ts                  # createApp(deps) — middleware stack, no I/O
+│   ├── config/
+│   │   ├── env.ts              # Zod-validated env; process exits on invalid config
+│   │   └── services.ts         # the routing table: prefix → upstream
+│   ├── proxy/service-proxy.ts  # one reverse proxy per registry entry
+│   ├── middlewares/
+│   │   ├── rate-limit.ts       # per-IP throttle on proxied traffic
+│   │   └── body-limit.ts       # Content-Length guard (bodies are never parsed)
+│   └── modules/health/         # liveness + aggregated upstream readiness
+└── tests/
+    ├── unit/
+    ├── integration/            # proxying verified against a real stub upstream
+    └── helpers/
 ```
 
 ## Architecture
@@ -394,6 +423,56 @@ reservations cannot both read the same pre-change level and jointly oversell.
 liveness/readiness split is what stops an orchestrator from restarting a healthy process just
 because the database blipped.
 
+## API gateway
+
+One public entry point on `:4000`. It is a router, not a translator: gateway paths match
+upstream paths exactly, so `POST :4000/api/v1/products` arrives at the product service as
+`POST /api/v1/products`. Adding a service means adding an entry to `src/config/services.ts` —
+proxying, readiness reporting, and the root banner all derive from that one table.
+
+What it does at the edge, that no individual service should have to:
+
+| Concern           | Behaviour                                                                 |
+| ----------------- | ------------------------------------------------------------------------- |
+| Routing           | `/api/v1/products` → `:4001`, `/api/v1/inventory` → `:4002`, path-for-path |
+| Correlation       | Mints `x-request-id` (honouring an inbound one) and forwards it upstream   |
+| Identity          | Drops any client-supplied `x-actor-id` — see below                         |
+| Rate limiting     | Per-IP, `RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW_MS`, health exempt         |
+| Upstream failures | `503` unreachable, `504` past `PROXY_TIMEOUT_MS`, `502` unusable reply     |
+| Client IP         | `x-forwarded-*` added so upstreams see the real caller                     |
+
+**The gateway never parses request bodies.** Parsing consumes the request stream the proxy has
+to pipe upstream, so mounting `express.json()` here would leave every proxied `POST` hanging
+with an empty payload. Only the declared `Content-Length` is checked, against `MAX_BODY_BYTES`;
+the service that understands the payload does the precise rejecting.
+
+**`x-actor-id` is stripped, not forwarded.** Downstream audit logs attribute writes to whatever
+arrives in that header, and the gateway is the only hop that talks to untrusted clients — so an
+inbound value is an unverified claim and is dropped. Nothing sets it yet, because there is no
+authentication at this edge; that is where it will be set once there is. `TRUST_CLIENT_ACTOR=true`
+passes the header through for local testing against services that expect an actor.
+
+**Failures use the same envelope as everything else.** A proxy error surfaces in a raw `http`
+callback rather than in Express, so `buildErrorBody` is shared between the two paths — a `504`
+from a dead upstream looks exactly like a `422` from a Zod schema, correlation id included.
+
+### Gateway health
+
+`GET :4000/api/v1/health/live` reports process liveness only. `GET /health/ready` probes every
+registered upstream concurrently and returns `503` when any is down, naming which and still
+reporting the ones that are up:
+
+```json
+{
+  "success": false,
+  "error": { "code": "SERVICE_UNAVAILABLE", "details": [{ "field": "inventory", "message": "fetch failed" }] },
+  "data": { "status": "degraded", "dependencies": { "product": { "status": "up", "latencyMs": 3 } } }
+}
+```
+
+Liveness deliberately ignores the upstreams: a gateway whose dependencies are down is still a
+healthy process, and restarting it would not help.
+
 ## Response format
 
 Success:
@@ -493,14 +572,38 @@ Beyond the shared keys (`PORT`, `DATABASE_URL`, `LOG_LEVEL`, `CORS_ORIGINS`, `BO
 | `INVENTORY_SERVICE_URL` | `http://localhost:4002` | Base URL of the inventory service               |
 | `INVENTORY_TIMEOUT_MS`  | `3000`                  | Per-request budget for inventory calls          |
 
-Keep the timeout well under any gateway timeout: a slow inventory service should degrade
-product reads to `stockStatus: UNKNOWN`, not hold connections until the caller gives up.
+Keep the timeout well under the gateway's `PROXY_TIMEOUT_MS`: a slow inventory service should
+degrade product reads to `stockStatus: UNKNOWN`, not hold connections until the caller gives up.
+
+The gateway has no `DATABASE_URL` or `BODY_LIMIT` — it is stateless and parses no bodies — and
+adds:
+
+| Variable                | Default                 | Purpose                                              |
+| ----------------------- | ----------------------- | ---------------------------------------------------- |
+| `PRODUCT_SERVICE_URL`   | `http://localhost:4001` | Upstream base URL                                    |
+| `INVENTORY_SERVICE_URL` | `http://localhost:4002` | Upstream base URL                                    |
+| `PROXY_TIMEOUT_MS`      | `15000`                 | Upstream response budget before `504`                |
+| `HEALTH_TIMEOUT_MS`     | `2000`                  | Budget for one readiness probe                       |
+| `RATE_LIMIT_WINDOW_MS`  | `60000`                 | Throttle window                                      |
+| `RATE_LIMIT_MAX`        | `300`                   | Requests per window, per IP, per replica             |
+| `MAX_BODY_BYTES`        | `1048576`               | Largest `Content-Length` forwarded                   |
+| `TRUST_CLIENT_ACTOR`    | `false`                 | Forward a client-supplied `x-actor-id` (testing only) |
+| `TRUST_PROXY`           | `loopback`              | Whether `x-forwarded-for` is believed                |
+
+`TRUST_PROXY` decides what `req.ip` resolves to, and `req.ip` is the rate limiter's key. It
+defaults to `loopback` rather than `true` because trusting every hop lets any client forge
+`x-forwarded-for` and hand itself a fresh bucket. Set it to the number of proxies actually in
+front of the gateway (`1` behind a single ingress); leaving it too strict is the safe failure —
+callers share a bucket rather than escaping one.
 
 ## Deployment notes
 
 - `pnpm build` compiles to `dist/`; `pnpm start` runs `node dist/server.js`.
 - `SIGTERM`/`SIGINT` drain in-flight requests, then close the Prisma pool, with
   `SHUTDOWN_TIMEOUT_MS` as a backstop so a stuck connection cannot block a rolling deploy.
-- `trust proxy` is enabled for accurate client IPs behind a gateway or ingress.
+- The services enable `trust proxy` for accurate client IPs behind the gateway or an ingress;
+  the gateway scopes it via `TRUST_PROXY` because its rate limiter keys on `req.ip`.
+- Only the gateway needs to be publicly reachable. The services should be bound to an internal
+  network — nothing in them authenticates a caller, and `x-actor-id` is trusted on arrival.
 - `helmet` sets security headers; CORS origins come from `CORS_ORIGINS` (`*`, or a
   comma-separated allow-list).
