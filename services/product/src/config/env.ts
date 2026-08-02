@@ -27,6 +27,17 @@ const envSchema = z.object({
       (value) => value.startsWith("postgres://") || value.startsWith("postgresql://"),
       "DATABASE_URL must be a postgres:// or postgresql:// connection string",
     ),
+  /** Base URL of the inventory service, without a trailing slash. */
+  INVENTORY_SERVICE_URL: z
+    .url("INVENTORY_SERVICE_URL must be an absolute http(s) URL")
+    .default("http://localhost:4002")
+    .transform((value) => value.replace(/\/+$/, "")),
+  /**
+   * Per-request budget for inventory calls. Kept well under a typical gateway
+   * timeout so a slow inventory service degrades product reads instead of
+   * holding connections open until the caller gives up.
+   */
+  INVENTORY_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000).default(3_000),
   /** Comma-separated origin list, or `*` for all. */
   CORS_ORIGINS: z.string().default("*"),
   BODY_LIMIT: z.string().default("100kb"),

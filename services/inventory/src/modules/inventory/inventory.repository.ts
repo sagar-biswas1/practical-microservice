@@ -87,6 +87,7 @@ export interface InventoryRepository {
   list(query: ListInventoryQuery): Promise<Paginated<InventoryItem>>;
   findById(id: string): Promise<InventoryItem | null>;
   findBySku(sku: string): Promise<InventoryItem | null>;
+  findByProductId(productId: string): Promise<InventoryItem | null>;
   create(input: CreateInventoryItemInput): Promise<InventoryItem>;
   /** Atomically re-reads, validates, writes, and records the field changes. */
   update(
@@ -119,6 +120,7 @@ export class PrismaInventoryRepository implements InventoryRepository {
         ? { sku: { contains: query.sku, mode: "insensitive" } }
         : {}),
       ...(query.productId ? { productId: query.productId } : {}),
+      ...(query.productIds ? { productId: { in: query.productIds } } : {}),
       ...(query.warehouse ? { warehouse: query.warehouse } : {}),
     };
 
@@ -150,6 +152,10 @@ export class PrismaInventoryRepository implements InventoryRepository {
 
   findBySku(sku: string): Promise<InventoryItem | null> {
     return this.prisma.inventoryItem.findUnique({ where: { sku } });
+  }
+
+  findByProductId(productId: string): Promise<InventoryItem | null> {
+    return this.prisma.inventoryItem.findUnique({ where: { productId } });
   }
 
   async create(input: CreateInventoryItemInput): Promise<InventoryItem> {

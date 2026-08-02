@@ -56,6 +56,10 @@ export class InMemoryInventoryRepository implements InventoryRepository {
       items = items.filter((item) => item.sku.toLowerCase().includes(needle));
     }
     if (query.productId) items = items.filter((item) => item.productId === query.productId);
+    if (query.productIds) {
+      const wanted = new Set(query.productIds);
+      items = items.filter((item) => wanted.has(item.productId));
+    }
     if (query.warehouse) items = items.filter((item) => item.warehouse === query.warehouse);
     if (query.lowStock) {
       items = items.filter((item) => item.quantity - item.reserved <= item.reorderLevel);
@@ -79,6 +83,10 @@ export class InMemoryInventoryRepository implements InventoryRepository {
 
   async findBySku(sku: string): Promise<InventoryItem | null> {
     return [...this.items.values()].find((item) => item.sku === sku) ?? null;
+  }
+
+  async findByProductId(productId: string): Promise<InventoryItem | null> {
+    return [...this.items.values()].find((item) => item.productId === productId) ?? null;
   }
 
   async create(input: CreateInventoryItemInput): Promise<InventoryItem> {

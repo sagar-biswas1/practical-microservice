@@ -40,16 +40,45 @@ const productFieldsSchema = z.strictObject({
     .length(3, "Currency must be a 3-letter ISO 4217 code")
     .transform((value) => value.toUpperCase()),
   status: z.enum(PRODUCT_STATUSES),
-  inventoryId: z.uuid("Inventory id must be a valid UUID"),
 });
 
+/**
+ * Opening stock, forwarded to the inventory service when the product is
+ * created. Omitted fields fall back to inventory's own defaults, so the whole
+ * object is optional. Validated here as well as downstream so an obviously
+ * bad payload fails before a second service is involved.
+ */
+const initialStockSchema = z.strictObject({
+  warehouse: z.string().trim().min(1).max(64).optional(),
+  quantity: z
+    .number()
+    .int("Quantity must be a whole number")
+    .nonnegative()
+    .max(1_000_000_000)
+    .optional(),
+  reorderLevel: z.number().int().nonnegative().max(1_000_000_000).optional(),
+});
+
+/**
+ * `inventoryId` is deliberately absent: the product service provisions the
+ * inventory record itself and owns that link. A client-supplied id could
+ * point at another product's stock.
+ */
 export const createProductSchema = productFieldsSchema.extend({
   currency: productFieldsSchema.shape.currency.default("USD"),
   status: productFieldsSchema.shape.status.default("DRAFT"),
+  stock: initialStockSchema.optional(),
 });
 
-// Every field optional, but reject a no-op patch so an empty body can't
-// masquerade as a successful update.
+/**
+ * Every field optional, but reject a no-op patch so an empty body can't
+ * masquerade as a successful update.
+ *
+ * Stock levels are not patchable here — they move through the inventory
+ * service's own endpoints (receive / sell / adjust), each of which records a
+ * ledger entry. A `sku` change is mirrored onto the inventory record so the
+ * two never drift apart.
+ */
 export const updateProductSchema = productFieldsSchema
   .partial()
   .refine((data) => Object.values(data).some((value) => value !== undefined), {

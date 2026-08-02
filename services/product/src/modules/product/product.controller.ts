@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import { validated } from "../../middlewares/validate.js";
 import { sendCreated, sendNoContent, sendPaginated, sendSuccess } from "../../utils/api-response.js";
+import type { CallContext } from "../../clients/inventory.client.js";
 import type { ProductService } from "./product.service.js";
 import type {
   CreateProductInput,
@@ -17,35 +18,43 @@ import type {
 export class ProductController {
   constructor(private readonly service: ProductService) {}
 
+  /** Correlation id and caller identity, forwarded on downstream calls. */
+  private static context(req: Request): CallContext {
+    return { requestId: req.id, actor: req.actor };
+  }
+
   list = async (req: Request, res: Response): Promise<void> => {
     const { query } = validated<unknown, ListProductsQuery>(req);
-    const { items, total } = await this.service.list(query);
+    const { items, total } = await this.service.list(query, ProductController.context(req));
     sendPaginated(res, items, { page: query.page, limit: query.limit, total });
   };
 
   getById = async (req: Request, res: Response): Promise<void> => {
     const { params } = validated<unknown, unknown, ProductIdParams>(req);
-    const product = await this.service.getById(params.id);
+    const product = await this.service.getById(params.id, ProductController.context(req));
     sendSuccess(res, product);
   };
 
   create = async (req: Request, res: Response): Promise<void> => {
     const { body } = validated<CreateProductInput>(req);
-    const product = await this.service.create(body);
-    req.log.info({ productId: product.id, sku: product.sku }, "product_created");
+    const product = await this.service.create(body, ProductController.context(req));
+    req.log.info(
+      { productId: product.id, sku: product.sku, inventoryId: product.stock?.inventoryId },
+      "product_created",
+    );
     sendCreated(res, product);
   };
 
   update = async (req: Request, res: Response): Promise<void> => {
     const { body, params } = validated<UpdateProductInput, unknown, ProductIdParams>(req);
-    const product = await this.service.update(params.id, body);
+    const product = await this.service.update(params.id, body, ProductController.context(req));
     req.log.info({ productId: product.id }, "product_updated");
     sendSuccess(res, product);
   };
 
   remove = async (req: Request, res: Response): Promise<void> => {
     const { params } = validated<unknown, unknown, ProductIdParams>(req);
-    await this.service.remove(params.id);
+    await this.service.remove(params.id, ProductController.context(req));
     req.log.info({ productId: params.id }, "product_deleted");
     sendNoContent(res);
   };

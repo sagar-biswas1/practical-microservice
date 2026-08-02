@@ -14,6 +14,13 @@ export interface ListProductsResult {
 }
 
 /**
+ * The row as written to the database. Opening stock is stripped out — it
+ * belongs to the inventory service — and the id is left to the database,
+ * because nothing has to reference the product before it exists.
+ */
+export type NewProductRecord = Omit<CreateProductInput, "stock">;
+
+/**
  * Persistence boundary for products. The service layer depends on this
  * interface, not on Prisma — which is what lets the tests swap in an
  * in-memory implementation and keeps the storage engine replaceable.
@@ -22,7 +29,7 @@ export interface ProductRepository {
   list(query: ListProductsQuery): Promise<ListProductsResult>;
   findById(id: string): Promise<Product | null>;
   findBySku(sku: string): Promise<Product | null>;
-  create(input: CreateProductInput): Promise<Product>;
+  create(input: NewProductRecord): Promise<Product>;
   update(id: string, input: UpdateProductInput): Promise<Product>;
   delete(id: string): Promise<void>;
 }
@@ -64,7 +71,7 @@ export class PrismaProductRepository implements ProductRepository {
     return this.prisma.product.findUnique({ where: { sku } });
   }
 
-  create(input: CreateProductInput): Promise<Product> {
+  create(input: NewProductRecord): Promise<Product> {
     return this.prisma.product.create({ data: input });
   }
 

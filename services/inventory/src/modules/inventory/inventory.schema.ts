@@ -120,6 +120,16 @@ export const listInventoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
   sku: z.string().trim().min(1).max(64).optional(),
   productId: z.uuid().optional(),
+  /**
+   * Comma-separated ids, for callers enriching a page of products in one
+   * round trip instead of one request per item.
+   */
+  productIds: z
+    .string()
+    .trim()
+    .transform((value) => value.split(",").map((id) => id.trim()).filter(Boolean))
+    .pipe(z.array(z.uuid("Each productId must be a valid UUID")).min(1).max(100))
+    .optional(),
   warehouse: z.string().trim().min(1).max(64).optional(),
   /** Only items at or below their reorder level. */
   lowStock: z

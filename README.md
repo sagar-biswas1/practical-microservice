@@ -8,6 +8,10 @@ A pnpm workspace with two independent HTTP services built on TypeScript, Express
 | `product`   | `4001` | Product catalogue                      | `http://localhost:4001/api/v1` |
 | `inventory` | `4002` | Stock levels + audited stock movements | `http://localhost:4002/api/v1` |
 
+The product service calls the inventory service over HTTP — it provisions a stock record for
+every product it creates and enriches its reads with stock levels. See
+[Cross-service composition](#cross-service-composition). The inventory service calls nobody.
+
 ## Quick start
 
 ```bash
@@ -38,8 +42,14 @@ DATABASE_URL=postgresql://…/db?schema=inventory    # inventory service
 
 Neither service may read the other's tables. `inventory_items.product_id` is a *soft*
 reference to the product service — deliberately not a foreign key, because consistency across
-a service boundary is eventual, enforced by events and compensation rather than by the
-database. Splitting onto two physical databases later means changing only the two URLs.
+a service boundary is eventual, enforced by compensation rather than by the database.
+Splitting onto two physical databases later means changing only the two URLs.
+
+**The reference points one way only.** `product_id` is `@unique` on `inventory_items`, and the
+`products` table holds no inventory id. A second reference pointing back would make the two
+rows mutually dependent — neither could be written first — and give one relationship two
+sources of truth that can disagree. One direction also makes provisioning safe to retry: the
+product id is all anyone needs to find, create, or repair the matching stock record.
 
 ## Project structure
 
@@ -64,13 +74,14 @@ services/<name>/
 │   │   ├── validate.ts         # Zod validation → req.validated
 │   │   ├── not-found-handler.ts
 │   │   └── error-handler.ts    # terminal handler: everything → one JSON shape
+│   ├── clients/                # outbound calls to other services (product only)
 │   ├── modules/<domain>/       # schema → repository → service → controller → routes
 │   ├── routes/index.ts         # mounts the API under /api/v1
 │   └── utils/                  # asyncHandler, response envelope helpers
 └── tests/
     ├── unit/                   # domain rules and services, no HTTP
     ├── integration/            # full middleware stack via supertest
-    └── helpers/                # in-memory repository fakes
+    └── helpers/                # in-memory repository + service-client fakes
 ```
 
 ## Architecture
@@ -101,6 +112,12 @@ design — it is what keeps business logic testable and the database swappable.
 | **Service**    | `inventory.service.ts`          | Business rules, orchestration                | Import Express or Prisma          |
 | **Rules**      | `inventory.rules.ts`            | Pure invariant checks and calculations       | Do any I/O                        |
 | **Repository** | `inventory.repository.ts`       | Talk to the database                         | Contain business rules            |
+| **Client**     | `clients/inventory.client.ts`   | Talk to another *service* over HTTP           | Contain business rules            |
+
+A **client** is the repository's mirror image: a repository is the boundary to a database, a
+client is the boundary to someone else's API. Both are interfaces the service depends on, and
+both have a fake in `tests/helpers/` — which is why the product service's tests need neither a
+database nor a running inventory service.
 
 Two consequences worth internalising:
 
@@ -126,7 +143,7 @@ and you have seen the whole system:
 7. inventory.service.ts     builds a "planner" describing the intended change
 8. inventory.repository.ts  opens a Serializable transaction, re-reads the row, runs the planner
 9. inventory.rules.ts       planReservation() — throws ConflictError if it would oversell
-10. inventory.repository.ts updates the item + writes a StockMovement, commits
+10. inventory.repository.ts updates the item + writes a StockMovementHistory row, commits
 11. utils/api-response.ts   wraps the result in { success: true, data: … }
 ```
 
@@ -148,15 +165,73 @@ server.ts  ──creates──>  PrismaInventoryRepository  ──injected into�
                                                                        createApp(deps)
 ```
 
+The product service wires one more dependency the same way — its service takes a repository
+*and* an inventory client:
+
+```
+server.ts  ──creates──>  PrismaProductRepository  ─┐
+           ──creates──>  HttpInventoryClient  ─────┴──>  ProductService  ──>  createApp(deps)
+```
+
 `server.ts` is the **only** file that names a concrete implementation. Everything else receives
 what it needs through a constructor or a function argument. Tests call `createApp()` with an
-`InMemoryInventoryRepository` instead, which is why `pnpm test` needs no database and finishes
-in under a second.
+`InMemoryProductRepository` and a `FakeInventoryClient` instead, which is why `pnpm test` needs
+no database, no running inventory service, and finishes in under a second.
 
 Practical rule: `server.ts` is the only file that imports the `prisma` client itself. Even the
 repository does not — it declares a `PrismaClient` constructor parameter and imports only the
 *type*. If you find yourself reaching for the client anywhere else, the logic is in the wrong
 layer.
+
+### Cross-service composition
+
+Stock lives in the inventory service, but callers want it next to the product. The product
+service composes the two through `src/clients/inventory.client.ts` — a typed interface plus an
+axios implementation, injected in `server.ts` exactly like a repository.
+
+**Reads degrade, they do not fail.** `GET /products/:id` reports a `stockStatus`:
+
+| Status           | Meaning                                                              |
+| ---------------- | -------------------------------------------------------------------- |
+| `IN_STOCK`       | `available > reorderLevel`                                            |
+| `LOW_STOCK`      | `0 < available <= reorderLevel`                                       |
+| `OUT_OF_STOCK`   | `available <= 0` — a real zero                                        |
+| `UNPROVISIONED`  | Inventory answered and has no record for this product                 |
+| `UNKNOWN`        | Inventory could not be reached                                        |
+
+The last two are not states of the stock, and neither may be folded into `OUT_OF_STOCK`: that
+turns an infrastructure problem into a business fact and stops you selling goods you hold. When
+inventory is down the product still returns `200` with `stock: null`. A listing enriches the
+whole page with **one** bulk call (`GET /inventory?productIds=…`), not one call per row.
+
+**Writes are sagas, not transactions.** A database transaction is a property of one connection
+to one database; the inventory write is an HTTP call to another process, and no `BEGIN` spans
+those. Wrapping the call in `prisma.$transaction` would be strictly worse — it holds a
+connection and its locks open for the duration of a remote call you do not control, and still
+rolls back only the local half. So each write is ordered so the undoable step happens first,
+with an explicit compensating call when the second step fails:
+
+| Operation | Order                                              | If the second step fails                        |
+| --------- | -------------------------------------------------- | ----------------------------------------------- |
+| `create`  | product row → provision inventory                   | Delete the product; caller sees a clean failure |
+| `update`  | inventory SKU → product row                         | Restore the previous inventory SKU              |
+| `remove`  | guard on stock → delete product → delete inventory  | Log the orphan for reconciliation; call succeeds |
+
+Compensation is best-effort by definition — the operation it is undoing has already failed, so
+a failure there cannot be reported to the caller. It logs at `error` with both ids
+(`product_rollback_failed`, `inventory_sku_rollback_failed`,
+`orphaned_inventory_cleanup_failed`) for a reconciliation job to pick up. The residue is always
+recoverable: a product with no stock record reads as `UNPROVISIONED` and can be re-provisioned
+from its id alone.
+
+The known gaps, stated plainly: there is no retry, no circuit breaker, and no idempotency key,
+so a client retry after a timeout can provision twice — the `@unique` constraint on
+`product_id` is what stops that becoming two stock records. A transactional outbox would close
+the remaining window at the cost of making `POST /products` eventually consistent.
+
+**Correlation and identity cross the boundary.** The client forwards `x-request-id` so one id
+spans both services' logs, and `x-actor-id` so an inventory audit row records the real caller
+rather than "unknown".
 
 ### Where does my code go?
 
@@ -171,6 +246,8 @@ layer.
 | Add a new error type or status mapping         | `errors/app-error.ts`, `middlewares/error-handler.ts`       |
 | Add something on every request (auth, metrics) | new file in `middlewares/`, registered in `app.ts`          |
 | Add a config value                             | `config/env.ts` + both `.env.example` files                 |
+| Call another service                           | `clients/<service>.client.ts` + its fake in `tests/helpers/` |
+| Change what stock a product exposes            | `product.service.ts` (`toProductView`, `toStockStatus`)      |
 
 ### Recipe: adding an endpoint
 
@@ -205,6 +282,11 @@ and ask whether it belongs in a layer instead.
 - **Defaults belong only on create schemas.** `.partial()` does not strip `.default()`, so a
   shared base carrying defaults turns an empty `PATCH` into a silent overwrite.
 - **No foreign keys across services.** `inventory_items.product_id` is just a UUID column.
+- **Never put a network call inside a database transaction.** It holds the connection and its
+  locks for the duration of a call you do not control, exhausts the pool under load, and buys
+  no atomicity — the remote side commits regardless. Order the calls and compensate instead.
+- **Cross-service references point one way.** Look stock up by `productId`; do not add an
+  inventory id back onto the product.
 - **Test the fake and the real implementation together.** If you add a method to a repository
   interface, update the in-memory fake in `tests/helpers/` or the build breaks — that is
   deliberate.
@@ -213,37 +295,95 @@ and ask whether it belongs in a layer instead.
 
 ### Product service (`:4001/api/v1`)
 
-| Method   | Path            | Notes                                                  |
-| -------- | --------------- | ------------------------------------------------------ |
-| `GET`    | `/products`     | `page`, `limit`, `status`, `search`, `sortBy`, `order` |
-| `POST`   | `/products`     | SKU and currency are normalised to upper case          |
-| `GET`    | `/products/:id` |                                                        |
-| `PATCH`  | `/products/:id` | Partial; an empty body is rejected                     |
-| `DELETE` | `/products/:id` | `204`                                                  |
+Every endpoint that returns a product body composes `stock` and `stockStatus` from the
+inventory service; `DELETE` returns `204` with no body.
+
+| Method   | Path            | Notes                                                                     |
+| -------- | --------------- | ------------------------------------------------------------------------- |
+| `GET`    | `/products`     | `page`, `limit`, `status`, `search`, `sortBy`, `order`; one bulk stock call |
+| `POST`   | `/products`     | Also provisions the inventory record; SKU and currency upper-cased         |
+| `GET`    | `/products/:id` |                                                                            |
+| `PATCH`  | `/products/:id` | Partial; empty body rejected; a `sku` change is mirrored onto inventory    |
+| `DELETE` | `/products/:id` | `204`; `409` while any stock or reservation remains                        |
+
+`POST /products` takes an optional `stock` object for opening levels; omitted fields fall back
+to inventory's own defaults. `inventoryId` is **not** accepted — the service owns that link:
+
+```json
+{
+  "sku": "kbd-100",
+  "name": "Mechanical Keyboard",
+  "priceCents": 12999,
+  "stock": { "quantity": 40, "reorderLevel": 5, "warehouse": "north" }
+}
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "…", "sku": "KBD-100", "status": "DRAFT",
+    "stockStatus": "IN_STOCK",
+    "stock": {
+      "inventoryId": "…", "warehouse": "north",
+      "quantity": 40, "reserved": 0, "available": 40, "reorderLevel": 5
+    }
+  }
+}
+```
+
+Stock *levels* are not patchable here. They move through the inventory endpoints below, each of
+which writes a ledger row; a second path into the same state would be a weaker one.
 
 ### Inventory service (`:4002/api/v1`)
 
-| Method   | Path                       | Notes                                       |
-| -------- | -------------------------- | ------------------------------------------- |
-| `GET`    | `/inventory`               | `sku`, `productId`, `warehouse`, `lowStock` |
-| `POST`   | `/inventory`               | One row per SKU                             |
-| `GET`    | `/inventory/:id`           |                                             |
-| `GET`    | `/inventory/sku/:sku`      | Lookup by SKU                               |
-| `PATCH`  | `/inventory/:id`           | `warehouse` / `reorderLevel` only           |
-| `DELETE` | `/inventory/:id`           | `409` while units are reserved              |
-| `GET`    | `/inventory/:id/movements` | Audit trail, newest first                   |
-| `POST`   | `/inventory/:id/reserve`   | Promise stock to an order                   |
-| `POST`   | `/inventory/:id/release`   | Return a reservation to the pool            |
-| `POST`   | `/inventory/:id/fulfil`    | Ship reserved units                         |
-| `POST`   | `/inventory/:id/receive`   | Book in a delivery                          |
-| `POST`   | `/inventory/:id/adjust`    | Signed correction; `reason` required        |
+| Method   | Path                        | Notes                                                        |
+| -------- | --------------------------- | ------------------------------------------------------------ |
+| `GET`    | `/inventory`                | `sku`, `productId`, `productIds` (CSV, bulk), `warehouse`, `lowStock` |
+| `POST`   | `/inventory`                | One row per SKU **and** per `productId`                      |
+| `GET`    | `/inventory/:id`            |                                                              |
+| `GET`    | `/inventory/sku/:sku`       | Lookup by SKU                                                |
+| `PATCH`  | `/inventory/:id`            | Any column except `reserved`; audited                        |
+| `DELETE` | `/inventory/:id`            | `409` while units are reserved                               |
+| `GET`    | `/inventory/:id/movements`  | Stock ledger, newest first; `?type=`                         |
+| `GET`    | `/inventory/:id/audit-logs` | Field-change trail; `?field=`, `?actor=`                     |
+| `POST`   | `/inventory/:id/reserve`    | Promise stock to an order                                    |
+| `POST`   | `/inventory/:id/release`    | Return a reservation to the pool                             |
+| `POST`   | `/inventory/:id/fulfil`     | Ship units that were reserved first                          |
+| `POST`   | `/inventory/:id/sell`       | Sell without a prior reservation; `reference` required       |
+| `POST`   | `/inventory/:id/receive`    | Book in a supplier delivery                                  |
+| `POST`   | `/inventory/:id/return`     | Take back sold units; `reference` required                   |
+| `POST`   | `/inventory/:id/adjust`     | Signed correction; `reason` required                         |
 
 Stock transitions are `POST`s on sub-resources rather than `PATCH`es on a counter: each one is
-a discrete, audited event that writes a `StockMovement` row.
+a discrete, audited event that writes a `StockMovementHistory` row.
+
+#### Two histories, kept apart
+
+`stock_movement_histories` is a **ledger**: every row is a real movement, carrying
+`quantityChanged`, the `lastQuantity` before it was applied, and a type:
+
+| Type          | Written by            | Effect                                  |
+| ------------- | --------------------- | --------------------------------------- |
+| `INBOUND`     | `/receive`, create    | `quantity +`                            |
+| `OUTBOUND`    | `/fulfil`, `/sell`    | `quantity −` (and `reserved −` on fulfil) |
+| `RESERVATION` | `/reserve`            | `reserved +`                            |
+| `RELEASE`     | `/release`            | `reserved −`                            |
+| `RETURN`      | `/return`             | `quantity +`, kept distinct from a purchase |
+| `ADJUSTMENT`  | `/adjust`, `PATCH`    | Signed correction                       |
+
+`inventory_audit_logs` is a **field-change trail**: who changed which column, from what to
+what. A `PATCH` writes one row per changed field, and a `quantity` edit additionally lands in
+the ledger so the two never disagree about on-hand stock. A no-op patch writes nothing.
+
+The actor comes from the `x-actor-id` header, set by the gateway and forwarded by the product
+service; it is `null` when the caller is unattributed.
 
 **Invariants** (`src/modules/inventory/inventory.rules.ts`): `quantity >= 0`, `reserved >= 0`,
-and `reserved <= quantity`. `available = quantity - reserved`. Reservations cannot oversell,
-and a downward adjustment cannot cut into units already promised to an order. These checks run
+and `reserved <= quantity`. `available = quantity - reserved`. Reservations cannot oversell, a
+direct sale may only consume what is *available* rather than the full on-hand count, and
+neither a downward adjustment nor a hand-edited `quantity` can cut into units already promised
+to an order. These checks run
 *inside* a `Serializable` transaction against freshly-read state, so two concurrent
 reservations cannot both read the same pre-change level and jointly oversell.
 
@@ -299,7 +439,9 @@ with a stack.
 
 pino, pretty-printed in development and JSON elsewhere, silent under test. Every request gets a
 correlation id — taken from an inbound `x-request-id` when present so one id spans the whole
-call chain — echoed in the response header and bound to `req.log`. Authorization headers,
+call chain — echoed in the response header and bound to `req.log`. An `x-actor-id` header, set
+by the gateway once it has authenticated the caller, is exposed as `req.actor`, forwarded on
+downstream calls, and stamped onto inventory audit rows. Authorization headers,
 cookies, passwords, tokens and `DATABASE_URL` are redacted. Morgan feeds structured access logs
 into the same sink, at `warn` for 4xx and `error` for 5xx.
 
@@ -311,10 +453,20 @@ pnpm test:watch
 pnpm --filter @services/inventory test:coverage
 ```
 
-Vitest + Supertest. **No database is required**: integration tests mount the real middleware
-stack against in-memory repository fakes, so they cover routing, validation, the error handler
-and the response envelope while staying fast and deterministic. Unit tests cover the domain
-rules and services directly.
+Vitest + Supertest. **No database and no running sibling service are required**: integration
+tests mount the real middleware stack against in-memory repository fakes, so they cover
+routing, validation, the error handler and the response envelope while staying fast and
+deterministic. Unit tests cover the domain rules and services directly.
+
+The product service's tests use two doubles — `InMemoryProductRepository` and
+`FakeInventoryClient`. The fake client records every call it receives (method, and the
+correlation context), and can be told to fail a chosen method, which is how the compensating
+paths are tested without breaking anything real.
+
+The HTTP client is covered separately in `tests/unit/inventory.client.test.ts`, against a
+throwaway `node:http` server: envelope unwrapping, header propagation, `204`, `404 → null`,
+status mapping, connection-refused and timeout. The fake proves the orchestration; only a real
+socket proves the wire format.
 
 ## Validation
 
@@ -332,6 +484,17 @@ empty `PATCH` body parse into real values and quietly overwrite columns.
 `src/config/env.ts` validates the environment with Zod at import time and exits with a readable
 report if anything is missing or malformed — the process fails at boot rather than at the first
 request. See `.env.example` in each service for the full list.
+
+Beyond the shared keys (`PORT`, `DATABASE_URL`, `LOG_LEVEL`, `CORS_ORIGINS`, `BODY_LIMIT`,
+`SHUTDOWN_TIMEOUT_MS`), the product service adds:
+
+| Variable                | Default                 | Purpose                                        |
+| ----------------------- | ----------------------- | ---------------------------------------------- |
+| `INVENTORY_SERVICE_URL` | `http://localhost:4002` | Base URL of the inventory service               |
+| `INVENTORY_TIMEOUT_MS`  | `3000`                  | Per-request budget for inventory calls          |
+
+Keep the timeout well under any gateway timeout: a slow inventory service should degrade
+product reads to `stockStatus: UNKNOWN`, not hold connections until the caller gives up.
 
 ## Deployment notes
 

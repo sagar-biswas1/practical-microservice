@@ -3,13 +3,15 @@ import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { logger } from "./lib/logger.js";
 import { checkDatabaseConnection, prisma } from "./lib/prisma.js";
+import { HttpInventoryClient } from "./clients/inventory.client.js";
 import { PrismaProductRepository } from "./modules/product/product.repository.js";
 import { ProductService } from "./modules/product/product.service.js";
 
 /** Composition root: the one place where concrete implementations are wired. */
 function buildServer() {
   const productRepository = new PrismaProductRepository(prisma);
-  const productService = new ProductService(productRepository);
+  const inventoryClient = new HttpInventoryClient();
+  const productService = new ProductService(productRepository, inventoryClient);
 
   return createApp({
     productService,

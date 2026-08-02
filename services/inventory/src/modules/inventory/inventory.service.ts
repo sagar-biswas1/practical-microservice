@@ -67,12 +67,27 @@ export class InventoryService {
     return toInventoryItemView(item);
   }
 
+  /** One stock record per product; both keys are checked before inserting. */
   async create(input: CreateInventoryItemInput): Promise<InventoryItemView> {
     const existing = await this.repository.findBySku(input.sku);
     if (existing) {
       throw new ConflictError(`Inventory for SKU '${input.sku}' already exists`);
     }
+
+    const forProduct = await this.repository.findByProductId(input.productId);
+    if (forProduct) {
+      throw new ConflictError(
+        `Inventory for product '${input.productId}' already exists as SKU '${forProduct.sku}'`,
+      );
+    }
+
     return toInventoryItemView(await this.repository.create(input));
+  }
+
+  /** Stock for a product, or null when it has not been provisioned yet. */
+  async getByProductId(productId: string): Promise<InventoryItemView | null> {
+    const item = await this.repository.findByProductId(productId);
+    return item ? toInventoryItemView(item) : null;
   }
 
   /**

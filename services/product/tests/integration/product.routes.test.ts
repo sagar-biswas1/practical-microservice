@@ -5,6 +5,7 @@ import { createApp } from "../../src/app.js";
 import { API_PREFIX } from "../../src/routes/index.js";
 import { ProductService } from "../../src/modules/product/product.service.js";
 import { InMemoryProductRepository } from "../helpers/in-memory-product-repository.js";
+import { FakeInventoryClient } from "../helpers/fake-inventory-client.js";
 
 const BASE = `${API_PREFIX}/products`;
 
@@ -16,20 +17,25 @@ const validPayload = {
   currency: "usd",
 };
 
-function buildApp(seed = new InMemoryProductRepository()): {
+function buildApp(
+  seed = new InMemoryProductRepository(),
+  inventory = new FakeInventoryClient(),
+): {
   app: Express;
   repository: InMemoryProductRepository;
+  inventory: FakeInventoryClient;
 } {
-  const app = createApp({ productService: new ProductService(seed) });
-  return { app, repository: seed };
+  const app = createApp({ productService: new ProductService(seed, inventory) });
+  return { app, repository: seed, inventory };
 }
 
 describe("products API", () => {
   let app: Express;
   let repository: InMemoryProductRepository;
+  let inventory: FakeInventoryClient;
 
   beforeEach(() => {
-    ({ app, repository } = buildApp());
+    ({ app, repository, inventory } = buildApp());
   });
 
   describe("POST /products", () => {
@@ -189,7 +195,10 @@ describe("products API", () => {
 
     it("reports readiness failures as 503", async () => {
       const failing = createApp({
-        productService: new ProductService(new InMemoryProductRepository()),
+        productService: new ProductService(
+          new InMemoryProductRepository(),
+          new FakeInventoryClient(),
+        ),
         checkReadiness: () => Promise.reject(new Error("connection refused")),
       });
 
@@ -212,13 +221,74 @@ describe("products API", () => {
       const exploding = new InMemoryProductRepository();
       exploding.findById = () => Promise.reject(new Error("secret db topology detail"));
 
-      const boomApp = createApp({ productService: new ProductService(exploding) });
+      const boomApp = createApp({
+        productService: new ProductService(exploding, new FakeInventoryClient()),
+      });
 
       const response = await request(boomApp)
         .get(`${BASE}/1c9e6679-7425-40de-944b-e07fc1f90ae7`)
         .expect(500);
 
       expect(response.body.error.code).toBe("INTERNAL_SERVER_ERROR");
+    });
+  });
+  describe("stock integration", () => {
+    it("provisions inventory and returns stock alongside the product", async () => {
+      const response = await request(app)
+        .post(BASE)
+        .set("x-actor-id", "ops@example.com")
+        .send({ ...validPayload, stock: { quantity: 40, reorderLevel: 5 } })
+        .expect(201);
+
+      expect(response.body.data).toMatchObject({
+        sku: "KBD-100",
+        stockStatus: "IN_STOCK",
+        stock: { quantity: 40, reserved: 0, available: 40, reorderLevel: 5 },
+      });
+
+      // The caller's identity reached the inventory service.
+      expect(inventory.calls[0]?.context).toMatchObject({ actor: "ops@example.com" });
+    });
+
+    it("rejects a client-supplied inventoryId", async () => {
+      const response = await request(app)
+        .post(BASE)
+        .send({ ...validPayload, inventoryId: "1c9e6679-7425-40de-944b-e07fc1f90ae7" })
+        .expect(422);
+
+      expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("serves the product with UNKNOWN stock when inventory is unreachable", async () => {
+      const created = await request(app).post(BASE).send(validPayload).expect(201);
+      inventory.fail("findByProductId");
+
+      const response = await request(app).get(`${BASE}/${created.body.data.id}`).expect(200);
+
+      expect(response.body.data).toMatchObject({ stock: null, stockStatus: "UNKNOWN" });
+    });
+
+    it("returns 409 when deleting a product that still holds stock", async () => {
+      const created = await request(app)
+        .post(BASE)
+        .send({ ...validPayload, stock: { quantity: 10 } })
+        .expect(201);
+
+      const response = await request(app)
+        .delete(`${BASE}/${created.body.data.id}`)
+        .expect(409);
+
+      expect(response.body.error.message).toMatch(/still holds stock/);
+      expect(repository.size).toBe(1);
+    });
+
+    it("deletes product and inventory together once stock is empty", async () => {
+      const created = await request(app).post(BASE).send(validPayload).expect(201);
+
+      await request(app).delete(`${BASE}/${created.body.data.id}`).expect(204);
+
+      expect(repository.size).toBe(0);
+      expect(inventory.size).toBe(0);
     });
   });
 });

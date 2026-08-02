@@ -34,7 +34,10 @@ enum StockMovementType {
 model InventoryItem {
   id           String   @id @default(cuid()) @db.Uuid
   sku          String   @unique @db.VarChar(64)
-  productId    String   @map("product_id") @db.Uuid
+  /// Unique: one stock record per product. This is what makes provisioning
+  /// safe to retry — a duplicated create is rejected by the database rather
+  /// than silently producing a second record for the same product.
+  productId    String   @unique @map("product_id") @db.Uuid
   warehouse    String   @default("default") @db.VarChar(64)
   /// Total units physically on hand, including reserved units.
   quantity     Int      @default(0)
@@ -47,7 +50,7 @@ model InventoryItem {
   movementHistories StockMovementHistory[]
   auditLogs         InventoryAuditLog[]
 
-  @@index([productId])
+  // No @@index([productId]) — the unique constraint above already provides one.
   @@index([warehouse])
   @@map("inventory_items")
 }

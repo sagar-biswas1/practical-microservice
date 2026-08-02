@@ -1,6 +1,11 @@
 // Product service owns this schema exclusively.
 // Database-per-service is emulated with a dedicated Postgres schema:
 // DATABASE_URL=postgresql://.../db?schema=product
+//
+// There is deliberately no `inventoryId` here. Stock lives in the inventory
+// service, keyed by `productId`; a second reference pointing back would make
+// the two rows mutually dependent — neither could be written first — and give
+// the same relationship two sources of truth that can disagree.
 
 generator client {
   provider     = "prisma-client"
@@ -28,7 +33,6 @@ model Product {
   priceCents  Int           @map("price_cents")
   currency    String        @default("USD") @db.Char(3)
   status      ProductStatus @default(DRAFT)
-  inventoryId String        @map("inventory_id") @db.Uuid
   createdAt   DateTime      @default(now()) @map("created_at")
   updatedAt   DateTime      @updatedAt @map("updated_at")
 

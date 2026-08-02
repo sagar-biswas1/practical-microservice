@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type {
   ListProductsResult,
+  NewProductRecord,
   Product,
   ProductRepository,
 } from "../../src/modules/product/product.repository.js";
 import type {
-  CreateProductInput,
   ListProductsQuery,
   UpdateProductInput,
 } from "../../src/modules/product/product.schema.js";
@@ -71,11 +71,12 @@ export class InMemoryProductRepository implements ProductRepository {
     return [...this.products.values()].find((item) => item.sku === sku) ?? null;
   }
 
-  async create(input: CreateProductInput): Promise<Product> {
+  async create(input: NewProductRecord): Promise<Product> {
+    // The id arrives from the service, not the store: it was minted before
+    // the inventory record so the two rows could reference each other.
     const product = InMemoryProductRepository.buildProduct({
       ...input,
       description: input.description ?? null,
-      id: randomUUID(),
     });
     this.products.set(product.id, product);
     return product;
