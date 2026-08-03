@@ -39,4 +39,10 @@ export const serviceRegistry: readonly ServiceRoute[] = [
     target: env.INVENTORY_SERVICE_URL,
     healthPath: `${API_PREFIX}/health/live`,
   },
+  {
+    name: "user",
+    prefix: `${API_PREFIX}/users`,
+    target: env.USER_SERVICE_URL,
+    healthPath: `${API_PREFIX}/health/live`,
+  },
 ];

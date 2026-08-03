@@ -23,6 +23,7 @@ describe("gateway surface", () => {
       expect(response.body.data.upstreams).toEqual([
         { name: "product", prefix: `${API_PREFIX}/products` },
         { name: "inventory", prefix: `${API_PREFIX}/inventory` },
+        { name: "user", prefix: `${API_PREFIX}/users` },
       ]);
     });
   });

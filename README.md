@@ -1,6 +1,6 @@
 # practical-microservice
 
-A pnpm workspace with two independent HTTP services behind an edge gateway, built on
+A pnpm workspace with three independent HTTP services behind an edge gateway, built on
 TypeScript, Express 5, Prisma 6 (PostgreSQL), and Zod 4.
 
 | Package       | Port   | Owns                                   | Base path                      |
@@ -8,14 +8,21 @@ TypeScript, Express 5, Prisma 6 (PostgreSQL), and Zod 4.
 | `api-gateway` | `4000` | Single public entry point (stateless)  | `http://localhost:4000/api/v1` |
 | `product`     | `4001` | Product catalogue                      | `http://localhost:4001/api/v1` |
 | `inventory`   | `4002` | Stock levels + audited stock movements | `http://localhost:4002/api/v1` |
+| `user`        | `4003` | User profiles keyed by an external login | `http://localhost:4003/api/v1` |
 
 The product service calls the inventory service over HTTP — it provisions a stock record for
 every product it creates and enriches its reads with stock levels. See
-[Cross-service composition](#cross-service-composition). The inventory service calls nobody.
+[Cross-service composition](#cross-service-composition). The inventory and user services call
+nobody.
 
-Clients talk to the gateway, which forwards `/api/v1/products` and `/api/v1/inventory` to the
-service that owns them. See [API gateway](#api-gateway). The services still listen on their own
-ports, so they can be exercised directly in development.
+The user service is also where the [error-first convention](#error-first-results-user-service)
+lives: its repository and service return `[error, data]` instead of throwing. It is the same
+architecture as the other two with a different failure channel — read that section before
+working in it.
+
+Clients talk to the gateway, which forwards `/api/v1/products`, `/api/v1/inventory` and
+`/api/v1/users` to the service that owns them. See [API gateway](#api-gateway). The services
+still listen on their own ports, so they can be exercised directly in development.
 
 ## Quick start
 
@@ -25,11 +32,12 @@ pnpm install
 # Each package reads its own .env, falling back to the repo-root .env.
 cp services/product/.env.example   services/product/.env
 cp services/inventory/.env.example services/inventory/.env
+cp services/user/.env.example      services/user/.env
 cp api-gateway/.env.example        api-gateway/.env
 
-pnpm db:generate     # generate both Prisma clients (required before typecheck/build)
+pnpm db:generate     # generate every Prisma client (required before typecheck/build)
 pnpm db:migrate      # create tables — see "Database layout" first
-pnpm dev             # run the gateway and both services concurrently
+pnpm dev             # run the gateway and all three services concurrently
 ```
 
 Root scripts (`dev`, `build`, `start`, `test`, `typecheck`, `db:generate`, `db:migrate`,
@@ -38,15 +46,16 @@ Root scripts (`dev`, `build`, `start`, `test`, `typecheck`, `db:generate`, `db:m
 
 ## Database layout
 
-Both services point at one PostgreSQL instance but own **separate Postgres schemas**, selected
+The services point at one PostgreSQL instance but own **separate Postgres schemas**, selected
 by the `?schema=` parameter in each service's `DATABASE_URL`:
 
 ```
 DATABASE_URL=postgresql://…/db?schema=product      # product service
 DATABASE_URL=postgresql://…/db?schema=inventory    # inventory service
+DATABASE_URL=postgresql://…/db?schema=user         # user service
 ```
 
-Neither service may read the other's tables. `inventory_items.product_id` is a *soft*
+No service may read another's tables. `inventory_items.product_id` is a *soft*
 reference to the product service — deliberately not a foreign key, because consistency across
 a service boundary is eventual, enforced by compensation rather than by the database.
 Splitting onto two physical databases later means changing only the two URLs.
@@ -73,7 +82,9 @@ services/<name>/
 │   ├── lib/
 │   │   ├── logger.ts           # pino (pretty in dev, JSON elsewhere) + redaction
 │   │   └── prisma.ts           # PrismaClient singleton + readiness probe
-│   ├── errors/app-error.ts     # AppError hierarchy + machine-readable error codes
+│   ├── errors/
+│   │   ├── app-error.ts        # AppError hierarchy + machine-readable error codes
+│   │   └── normalize.ts        # anything thrown → AppError  (user service only)
 │   ├── middlewares/
 │   │   ├── request-context.ts  # correlation id + request-scoped logger
 │   │   ├── request-logger.ts   # morgan → pino, structured access logs
@@ -84,6 +95,7 @@ services/<name>/
 │   ├── modules/<domain>/       # schema → repository → service → controller → routes
 │   ├── routes/index.ts         # mounts the API under /api/v1
 │   └── utils/                  # asyncHandler, response envelope helpers
+│       └── result.ts           # [error, data] tuples             (user service only)
 └── tests/
     ├── unit/                   # domain rules and services, no HTTP
     ├── integration/            # full middleware stack via supertest
@@ -212,6 +224,56 @@ repository does not — it declares a `PrismaClient` constructor parameter and i
 *type*. If you find yourself reaching for the client anywhere else, the logic is in the wrong
 layer.
 
+### Error-first results (user service)
+
+The product and inventory services signal failure by **throwing**: a service raises
+`NotFoundError`, nothing catches it, and `error-handler.ts` turns it into a 404. The user
+service does the same job with an **error-first return** instead — the Node-callback shape,
+awaited:
+
+```ts
+type Ok<T>  = [error: null,     data: T];
+type Err<E> = [error: E,        data: null];
+type Result<T, E extends Error = AppError> = Ok<T> | Err<E>;
+```
+
+Every repository and service method in `services/user` returns one. The controller unpacks it
+and hands any failure to Express:
+
+```ts
+const [error, user] = await this.service.getById(params.id);
+if (error) return next(error);
+sendSuccess(res, user);          // `user` is narrowed to User here, not User | null
+```
+
+That narrowing is the entire argument for the pattern. The tuple is a discriminated union, so
+TypeScript refuses to give you `data` until `error` has been checked — **an unhandled failure
+becomes a compile error rather than an exception discovered in production.** A thrown error is
+invisible in a signature; this one is part of it.
+
+Three rules keep it honest:
+
+- **`null` data is not an error.** A lookup that finds nothing returns `[null, null]`. Absence
+  is an ordinary answer, and only the service knows whether it means "404" or "good, that email
+  is free". `[error, null]` is reserved for the store failing to answer at all — which is why
+  `getById` on a downed database is a `503`, not a `404`.
+- **Errors are always `AppError`s.** `utils/result.ts#attempt` wraps the one place that still
+  throws — Prisma — and normalises whatever comes out via `errors/normalize.ts`. Nothing above
+  the repository ever handles a raw Prisma type.
+- **The tuple stops at the controller.** `next(error)` is Express's own error channel, so the
+  same `error-handler.ts` renders it identically to a thrown one. The response envelope, the
+  status mapping and the correlation id are unchanged; only the plumbing below differs.
+
+`errors/normalize.ts` is the refactor that made this possible: `toAppError` used to live inside
+the error middleware, where a repository could not reach it. In the user service it is a
+plain, Express-free module that both the middleware and `attempt` import.
+
+**The cost, stated plainly.** Every call site grows two lines, and a `return fail(error)` chain
+replaces free propagation up the stack — an intermediate layer that has nothing to add still
+has to forward the failure explicitly. That verbosity *is* the feature (nothing passes
+silently), but it is a real trade, and it is why the two older services were left throwing
+rather than converted. Pick one per service and stay consistent inside it.
+
 ### Cross-service composition
 
 Stock lives in the inventory service, but callers want it next to the product. The product
@@ -306,7 +368,9 @@ and ask whether it belongs in a layer instead.
   getter-only, so writing to them throws; `validate` puts parsed *and type-coerced* values on
   `req.validated`.
 - **Throw `AppError` subclasses, never bare `Error`.** `new NotFoundError(...)` becomes a clean
-  404; a bare `Error` becomes a generic 500 with the message hidden in production.
+  404; a bare `Error` becomes a generic 500 with the message hidden in production. In the user
+  service, `return fail(new NotFoundError(...))` instead — same classes, different channel; see
+  [Error-first results](#error-first-results-user-service).
 - **Bodies use `z.strictObject`**, so unknown fields are rejected rather than silently ignored.
 - **Defaults belong only on create schemas.** `.partial()` does not strip `.default()`, so a
   shared base carrying defaults turns an empty `PATCH` into a silent overwrite.
@@ -416,6 +480,29 @@ to an order. These checks run
 *inside* a `Serializable` transaction against freshly-read state, so two concurrent
 reservations cannot both read the same pre-change level and jointly oversell.
 
+### User service (`:4003/api/v1`)
+
+Profiles for people who already exist somewhere else. This service owns the *profile*, not the
+login: `authUserId` is a soft reference to whatever identity provider authenticated the caller,
+deliberately not a foreign key, because that record lives outside this database.
+
+| Method   | Path                      | Notes                                                       |
+| -------- | ------------------------- | ----------------------------------------------------------- |
+| `POST`   | `/users`                  | `409` on a duplicate `authUserId` or `email`                 |
+| `GET`    | `/users/:id`              |                                                              |
+| `GET`    | `/users/auth/:authUserId` | Resolve a login to its profile — the lookup other services use |
+| `PATCH`  | `/users/:id`              | Partial; empty body rejected; `authUserId` is not patchable  |
+| `DELETE` | `/users/:id`              | `204`; `404` for an unknown id                               |
+
+`email` is lower-cased on the way in, because the column is unique and `A@x.com` and `a@x.com`
+are the same mailbox — normalising at the schema keeps uniqueness from depending on who wrote
+the query. `authUserId` is immutable once set: re-pointing a profile at a different login is an
+account merge, with its own rules, not a field edit.
+
+The uniqueness checks in the service are advisory. They exist to return a 409 naming the field;
+the unique indexes on `auth_user_id` and `email` are what actually settle a race, and Prisma's
+`P2002` normalises to the same 409, so the loser gets the same answer either way.
+
 ### Health endpoints
 
 `GET /api/v1/health` and `/health/live` report process liveness (no I/O).
@@ -434,7 +521,7 @@ What it does at the edge, that no individual service should have to:
 
 | Concern           | Behaviour                                                                 |
 | ----------------- | ------------------------------------------------------------------------- |
-| Routing           | `/api/v1/products` → `:4001`, `/api/v1/inventory` → `:4002`, path-for-path |
+| Routing           | `/products` → `:4001`, `/inventory` → `:4002`, `/users` → `:4003`, path-for-path |
 | Correlation       | Mints `x-request-id` (honouring an inbound one) and forwards it upstream   |
 | Identity          | Drops any client-supplied `x-actor-id` — see below                         |
 | Rate limiting     | Per-IP, `RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW_MS`, health exempt         |
@@ -527,7 +614,7 @@ into the same sink, at `warn` for 4xx and `error` for 5xx.
 ## Testing
 
 ```bash
-pnpm test               # both services
+pnpm test               # every package
 pnpm test:watch
 pnpm --filter @services/inventory test:coverage
 ```
@@ -582,6 +669,7 @@ adds:
 | ----------------------- | ----------------------- | ---------------------------------------------------- |
 | `PRODUCT_SERVICE_URL`   | `http://localhost:4001` | Upstream base URL                                    |
 | `INVENTORY_SERVICE_URL` | `http://localhost:4002` | Upstream base URL                                    |
+| `USER_SERVICE_URL`      | `http://localhost:4003` | Upstream base URL                                    |
 | `PROXY_TIMEOUT_MS`      | `15000`                 | Upstream response budget before `504`                |
 | `HEALTH_TIMEOUT_MS`     | `2000`                  | Budget for one readiness probe                       |
 | `RATE_LIMIT_WINDOW_MS`  | `60000`                 | Throttle window                                      |

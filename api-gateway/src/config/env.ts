@@ -32,6 +32,7 @@ const envSchema = z.object({
   /** Upstreams. The gateway is stateless — it owns no database. */
   PRODUCT_SERVICE_URL: upstreamUrl("http://localhost:4001"),
   INVENTORY_SERVICE_URL: upstreamUrl("http://localhost:4002"),
+  USER_SERVICE_URL: upstreamUrl("http://localhost:4003"),
 
   /**
    * How long an upstream has to respond before the gateway gives up and

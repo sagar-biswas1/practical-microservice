@@ -85,14 +85,16 @@ export const updateProductSchema = productFieldsSchema
     message: "At least one field must be provided",
   });
 
-export const listProductsQuerySchema = z.object({
-  page: z.coerce.number().int().min(1).default(1),
-  limit: z.coerce.number().int().min(1).max(100).default(20),
-  status: z.enum(PRODUCT_STATUSES).optional(),
-  search: z.string().trim().min(1).max(120).optional(),
-  sortBy: z.enum(PRODUCT_SORT_FIELDS).default("createdAt"),
-  order: z.enum(["asc", "desc"]).default("desc"),
-});
+export const listProductsQuerySchema = z
+  .object({
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+    status: z.enum(PRODUCT_STATUSES).optional(),
+    search: z.string().trim().min(1).max(120).optional(),
+    sortBy: z.enum(PRODUCT_SORT_FIELDS).default("createdAt"),
+    order: z.enum(["asc", "desc"]).default("desc"),
+  })
+  .strict();
 
 export type CreateProductInput = z.infer<typeof createProductSchema>;
 export type UpdateProductInput = z.infer<typeof updateProductSchema>;

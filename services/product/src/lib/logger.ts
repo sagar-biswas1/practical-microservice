@@ -35,7 +35,7 @@ export const logger: Logger = isDevelopment
         options: {
           colorize: true,
           translateTime: "SYS:HH:MM:ss.l",
-          ignore: "pid,hostname,service,env",
+          ignore: "pid,hostname,service",
         },
       },
     })
