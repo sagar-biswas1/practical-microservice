@@ -1,0 +1,141 @@
+// Email service owns this schema exclusively.
+// Database-per-service is emulated with a dedicated Postgres schema:
+// DATABASE_URL=postgresql://.../db?schema=email
+//
+// `email_messages` is a transactional outbox. A caller's request writes a row
+// and commits; nothing is sent to the mail provider inside that transaction.
+// A background dispatcher claims due rows afterwards and performs the network
+// call. That split is the whole point: the database can guarantee atomicity
+// for its own writes, but it cannot guarantee anything about an HTTP call to
+// a third party, so the two are never mixed in one unit of work.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+  runtime      = "nodejs"
+}
+
+// `url` is the pooled endpoint the running service uses. `directUrl` is the
+// unpooled one, used only by migrate/introspect.
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/// Lifecycle of one outbox row. Transitions are one-way except for the
+/// operator-driven retry, which returns a DEAD or FAILED row to PENDING.
+///
+/// PENDING -> SENDING -> SENT
+///                    -> FAILED -> SENDING -> ...
+///                    -> DEAD (retries exhausted, or the provider rejected
+///                             the message in a way that retrying cannot fix)
+enum EmailStatus {
+  /// Written and committed, waiting for a dispatcher to claim it.
+  PENDING
+  /// Claimed by a dispatcher; a send is in flight or the worker died holding
+  /// it. `lockedAt` is what tells those two apart.
+  SENDING
+  /// The provider accepted it. `providerMessageId` is its receipt.
+  SENT
+  /// A retryable attempt failed. `nextAttemptAt` holds it back until the
+  /// backoff expires.
+  FAILED
+  /// Terminal. Nothing will pick this row up again without an explicit retry.
+  /// This is the dead-letter state.
+  DEAD
+}
+
+enum EmailBodyType {
+  TEXT
+  HTML
+}
+
+model EmailMessage {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// RFC 5321 caps a full address at 320 octets (64 local + @ + 255 domain).
+  recipient String        @db.VarChar(320)
+  subject   String        @db.VarChar(255)
+  /// Unbounded at the column level on purpose — a marketing HTML body can run
+  /// to tens of kilobytes, and a VarChar cap here would surface as a Postgres
+  /// error instead of a 422. The ceiling is enforced in the request schema,
+  /// where it can be reported per-field.
+  body      String        @db.Text
+  bodyType  EmailBodyType @default(TEXT) @map("body_type")
+  /// Who asked for this email — a service or event name, e.g. `user-service`
+  /// or `order.confirmed`. Purely descriptive; it is what makes "which part
+  /// of the system is mailing this person" answerable.
+  source    String        @db.VarChar(100)
+
+  status EmailStatus @default(PENDING)
+
+  // ---- Dispatch bookkeeping -------------------------------------------------
+
+  /// Completed attempts. Incremented after each send returns, success or not.
+  attempts    Int @default(0)
+  /// Per-message ceiling, copied from config at enqueue time so that changing
+  /// the default later does not silently revive rows already declared dead.
+  maxAttempts Int @default(5) @map("max_attempts")
+
+  /// Earliest time a dispatcher may claim this row. Backoff is expressed by
+  /// pushing this forward rather than by sleeping, so a restart cannot lose it.
+  nextAttemptAt DateTime  @default(now()) @map("next_attempt_at")
+  /// When the current claim was taken. A SENDING row whose lock is older than
+  /// the claim timeout is assumed orphaned and is reclaimed.
+  lockedAt      DateTime? @map("locked_at")
+  /// Which dispatcher instance holds the claim. Also how a worker fetches back
+  /// exactly the rows it just won.
+  lockedBy      String?   @map("locked_by") @db.VarChar(100)
+
+  /// Truncated to fit — this is a breadcrumb for an operator, not a log sink.
+  lastError         String?   @map("last_error") @db.VarChar(1000)
+  /// Which provider accepted (or last rejected) the message. Recorded per-row
+  /// because the provider can be swapped while rows are still in flight.
+  provider          String?   @db.VarChar(50)
+  providerMessageId String?   @map("provider_message_id") @db.VarChar(255)
+  sentAt            DateTime? @map("sent_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  idempotencyKey IdempotencyKey?
+
+  /// The claim query's index. Ordered (status, nextAttemptAt) so the planner
+  /// can seek straight to the oldest due row for a status.
+  ///
+  /// An index on `status` alone would be close to useless: almost every row
+  /// ends up SENT, so the column has terrible cardinality and Postgres would
+  /// fall back to a sequential scan as the table grows.
+  @@index([status, nextAttemptAt])
+  /// Supports the purge job and the default listing order.
+  @@index([createdAt])
+  @@index([source])
+  @@map("email_messages")
+}
+
+/// De-duplicates inbound requests.
+///
+/// A caller that times out and retries must not produce a second email. The
+/// key is supplied by the caller (`Idempotency-Key` header) and written in the
+/// same transaction as the message it created, so the pair is atomic: there is
+/// no window in which a message exists without its key, or the reverse.
+model IdempotencyKey {
+  key String @id @db.VarChar(255)
+
+  /// SHA-256 of the canonical request payload. Guards against a caller reusing
+  /// one key for two different emails — that is a bug on their side, and
+  /// silently returning the first message would hide it.
+  requestFingerprint String @map("request_fingerprint") @db.VarChar(64)
+
+  /// The message this key produced. Replays return it verbatim.
+  emailMessageId String       @unique @map("email_message_id") @db.Uuid
+  emailMessage   EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  /// Keys are pruned by age, same as the messages they point at.
+  @@index([createdAt])
+  @@map("idempotency_keys")
+}

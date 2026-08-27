@@ -1,6 +1,6 @@
 # practical-microservice
 
-A pnpm workspace with two independent HTTP services behind an edge gateway, built on
+A pnpm workspace of independent HTTP services behind an edge gateway, built on
 TypeScript, Express 5, Prisma 6 (PostgreSQL), and Zod 4.
 
 | Package       | Port   | Owns                                   | Base path                      |
@@ -8,14 +8,28 @@ TypeScript, Express 5, Prisma 6 (PostgreSQL), and Zod 4.
 | `api-gateway` | `4000` | Single public entry point (stateless)  | `http://localhost:4000/api/v1` |
 | `product`     | `4001` | Product catalogue                      | `http://localhost:4001/api/v1` |
 | `inventory`   | `4002` | Stock levels + audited stock movements | `http://localhost:4002/api/v1` |
+| `user`        | `4003` | User profiles                          | `http://localhost:4003/api/v1` |
+| `email`       | `4004` | Transactional outbox + mail delivery   | `http://localhost:4004/api/v1` |
+| `auth`        | `4005` | Logins, sessions, verification codes   | `http://localhost:4005/api/v1` |
 
 The product service calls the inventory service over HTTP — it provisions a stock record for
 every product it creates and enriches its reads with stock levels. See
 [Cross-service composition](#cross-service-composition). The inventory service calls nobody.
 
+The auth service calls both the email service (to mail a verification code) and the user
+service (to create the profile once an account verifies). Neither call happens inside a
+database transaction, and neither is allowed to fail the request that triggered it — see
+[services/auth/README.md](services/auth/README.md). The user and email services call nobody.
+
 Clients talk to the gateway, which forwards `/api/v1/products` and `/api/v1/inventory` to the
 service that owns them. See [API gateway](#api-gateway). The services still listen on their own
 ports, so they can be exercised directly in development.
+
+The gateway's routing table does **not** yet carry `user`, `email` or `auth` — those three are
+reached directly on their own ports for now. Adding them is one entry each in
+`api-gateway/src/config/services.ts` plus an upstream URL; the reason it has not happened is
+that authentication at the edge is still an open question, and routing `/api/v1/auth` through a
+gateway that cannot yet verify a token would only move the problem.
 
 ## Quick start
 
@@ -25,28 +39,47 @@ pnpm install
 # Each package reads its own .env, falling back to the repo-root .env.
 cp services/product/.env.example   services/product/.env
 cp services/inventory/.env.example services/inventory/.env
+cp services/user/.env.example      services/user/.env
+cp services/email/.env.example     services/email/.env
+cp services/auth/.env.example      services/auth/.env
 cp api-gateway/.env.example        api-gateway/.env
 
-pnpm db:generate     # generate both Prisma clients (required before typecheck/build)
+# The auth service has one variable with no default and refuses to boot without it.
+node -e "console.log('JWT_SECRET=' + require('crypto').randomBytes(48).toString('base64url'))" \
+  >> services/auth/.env
+
+pnpm db:generate     # generate every Prisma client (required before typecheck/build)
 pnpm db:migrate      # create tables — see "Database layout" first
-pnpm dev             # run the gateway and both services concurrently
+pnpm dev             # run the gateway and every service concurrently
 ```
 
 Root scripts (`dev`, `build`, `start`, `test`, `typecheck`, `db:generate`, `db:migrate`,
 `db:push`) fan out to every workspace package via `pnpm -r`. Run one package on its own with
 `pnpm --filter @services/product <script>` or `pnpm --filter api-gateway <script>`.
 
+`argon2` — the auth service's password hasher — is a native module, so it is listed under
+`onlyBuiltDependencies` in `pnpm-workspace.yaml`. Without that entry pnpm installs the package
+but skips its install script, and the addon is missing at runtime rather than at install time.
+
+Nothing forces you to run all six. The auth service degrades on purpose when its neighbours are
+absent: registration answers `emailQueued: false` if the email service is unreachable, and
+verification answers `profileCreated: false` if the user service is. Both are recoverable — by
+a resend and by the next login respectively — so a partial stack is a normal way to work.
+
 ## Database layout
 
-Both services point at one PostgreSQL instance but own **separate Postgres schemas**, selected
-by the `?schema=` parameter in each service's `DATABASE_URL`:
+Every service points at one PostgreSQL instance but owns a **separate Postgres schema**,
+selected by the `?schema=` parameter in its own `DATABASE_URL`:
 
 ```
 DATABASE_URL=postgresql://…/db?schema=product      # product service
 DATABASE_URL=postgresql://…/db?schema=inventory    # inventory service
+DATABASE_URL=postgresql://…/db?schema=user         # user service
+DATABASE_URL=postgresql://…/db?schema=email        # email service
+DATABASE_URL=postgresql://…/db?schema=auth         # auth service
 ```
 
-Neither service may read the other's tables. `inventory_items.product_id` is a *soft*
+No service may read another's tables. `inventory_items.product_id` is a *soft*
 reference to the product service — deliberately not a foreign key, because consistency across
 a service boundary is eventual, enforced by compensation rather than by the database.
 Splitting onto two physical databases later means changing only the two URLs.
@@ -56,6 +89,25 @@ Splitting onto two physical databases later means changing only the two URLs.
 rows mutually dependent — neither could be written first — and give one relationship two
 sources of truth that can disagree. One direction also makes provisioning safe to retry: the
 product id is all anyone needs to find, create, or repair the matching stock record.
+
+The identity side of the repo follows the same rule with one deliberate difference — the soft
+reference is stored on **both** ends:
+
+| Column                        | Points at            | Nullable | Why                                                     |
+| ----------------------------- | -------------------- | -------- | ------------------------------------------------------- |
+| `user."User"."authUserId"`    | `auth.auth_users.id` | no       | A profile without a login is not a thing that can exist  |
+| `auth.auth_users.user_id`     | `user."User".id`     | **yes**  | A login without a profile is an ordinary, temporary state |
+
+(The user service declares no `@map`/`@@map`, so its table and columns keep Prisma's
+PascalCase/camelCase names and need quoting in SQL; `email` and `auth` map theirs to snake_case.
+Worth reconciling one day — it is a rename plus a migration, not a design question.)
+
+That is not the mutual dependency warned about above, because the two are not symmetric. The
+user service's column is required and set at insert time — it is *how* a profile is created.
+The auth service's is nullable and written afterwards, and its null is meaningful: it says the
+profile hand-off has not succeeded yet. There is still one source of truth for the
+relationship (the user service's row); `auth_users.user_id` is a cache of where to find it,
+and the `@unique` on it is what stops a retry attaching a second profile to one login.
 
 ## Project structure
 
@@ -80,7 +132,7 @@ services/<name>/
 │   │   ├── validate.ts         # Zod validation → req.validated
 │   │   ├── not-found-handler.ts
 │   │   └── error-handler.ts    # terminal handler: everything → one JSON shape
-│   ├── clients/                # outbound calls to other services (product only)
+│   ├── clients/                # outbound calls to other services (product, auth)
 │   ├── modules/<domain>/       # schema → repository → service → controller → routes
 │   ├── routes/index.ts         # mounts the API under /api/v1
 │   └── utils/                  # asyncHandler, response envelope helpers
@@ -115,9 +167,9 @@ api-gateway/
 
 ## Architecture
 
-**Read this first if you are new.** Both services have the same shape — learn one and you can
-work in the other. Examples below use the inventory service; substitute `product` and the
-files line up one for one.
+**Read this first if you are new.** Every service has the same shape — learn one and you can
+work in any of them. Examples below use the inventory service; substitute `product`, `user`,
+`email` or `auth` and the files line up one for one.
 
 ### The one-paragraph version
 
@@ -261,6 +313,39 @@ the remaining window at the cost of making `POST /products` eventually consisten
 **Correlation and identity cross the boundary.** The client forwards `x-request-id` so one id
 spans both services' logs, and `x-actor-id` so an inventory audit row records the real caller
 rather than "unknown".
+
+#### The identity half, which compensates forwards instead of backwards
+
+The auth service makes two outbound calls, and neither uses the rollback strategy above. The
+difference is worth understanding, because it is the same problem answered the other way round.
+
+| Call                             | When                      | On failure                                      |
+| -------------------------------- | ------------------------- | ----------------------------------------------- |
+| `POST email-svc /emails`         | After registration commits | `emailQueued: false`; the user asks for a resend |
+| `POST user-svc /users`           | After verification commits | `profileCreated: false`; the next login retries  |
+
+`POST /products` rolls **back** when provisioning fails — it deletes the product, and the
+caller sees a clean failure. Auth cannot do that. Undoing a registration because a *different*
+service is down would throw away a password the user just chose, and undoing a verification
+would mean telling someone who correctly entered their code that they had not. In both cases
+the local write is the valuable one and the remote call is the follow-up, so the operation
+commits and the gap is closed **forwards**: every login retries the profile hand-off, and every
+`resend-verification` retries the mail.
+
+That inverts which state is allowed to be temporarily wrong. Product/inventory tolerates no
+product without stock and pays for it with a rollback; auth tolerates a verified account with
+no profile and pays for it with a nullable column and a retry on the next request. Both are
+sagas. Neither is a distributed transaction, because there is no such thing here.
+
+A `409` from the user service is treated as **success**, not failure: it means an earlier
+hand-off committed there but its response was lost. The profile exists, so auth looks it up by
+`authUserId` and attaches the id it already should have had. This is the one place the
+`GET /users/auth/:authUserId` endpoint earns its keep.
+
+Auth also sends `Idempotency-Key: <verification id>` on every mail, so a retry after a timeout
+returns the message the first attempt created rather than sending a second code. That is the
+retry protection the product service is documented as lacking — the outbox is what makes it
+available.
 
 ### Where does my code go?
 
@@ -416,6 +501,119 @@ to an order. These checks run
 *inside* a `Serializable` transaction against freshly-read state, so two concurrent
 reservations cannot both read the same pre-change level and jointly oversell.
 
+### User service (`:4003/api/v1`)
+
+Profiles only. This service holds no password, no session and no token — it does not know how
+anyone authenticates, and that is the point of it being separate from `auth`.
+
+| Method   | Path                      | Notes                                                        |
+| -------- | ------------------------- | ------------------------------------------------------------ |
+| `POST`   | `/users`                  | Called by the auth service once an account verifies           |
+| `GET`    | `/users/auth/:authUserId` | Resolve a login to a profile — two segments, so `/:id` cannot shadow it |
+| `GET`    | `/users/:id`              |                                                              |
+| `PATCH`  | `/users/:id`              | Partial; empty body rejected; `authUserId` is **not** patchable |
+| `DELETE` | `/users/:id`              | `204`                                                        |
+
+`authUserId` is excluded from `PATCH` deliberately. Re-pointing a profile at a different login
+is an account merge — an operation with its own rules about what happens to the orphaned side —
+not a field edit, and allowing it here would make it look like one.
+
+`GET /users/auth/:authUserId` exists because callers hold the *identity provider's* id, not
+this service's. It is the lookup the auth service uses to recover from a hand-off whose
+response was lost.
+
+### Email service (`:4004/api/v1`)
+
+A transactional outbox. `POST /emails` writes a row and commits; it does **not** send anything.
+A background dispatcher claims due rows afterwards and makes the network call. Full rationale
+in [services/email/README.md](services/email/README.md).
+
+| Method | Path                | Notes                                                              |
+| ------ | ------------------- | ------------------------------------------------------------------ |
+| `POST` | `/emails`           | **`202`**, not `201` — accepted into the outbox, not delivered      |
+| `GET`  | `/emails`           | `page`, `limit`, `status`, `source`, `recipient`                    |
+| `GET`  | `/emails/stats`     | Queue depth by status — what a dashboard or alert rule watches      |
+| `GET`  | `/emails/:id`       | How a caller finds out what happened to a message it enqueued       |
+| `POST` | `/emails/:id/retry` | `202`; `FAILED` and `DEAD` only                                     |
+| `POST` | `/emails/dispatch`  | Runs one dispatch cycle on demand; registered only when a dispatcher is wired in |
+
+The `202` is the contract, and it is worth being blunt about why: at that moment the row is
+committed and nothing more. Answering `201 Created` would be a claim about a mailbox this
+service has not contacted yet, and callers act on that difference.
+
+`Idempotency-Key` is optional but is what a *service* caller should always send. The key is
+written in the same transaction as the message, so a caller that times out and retries gets the
+original message back — answered `200` with an `Idempotent-Replay: true` header — instead of
+mailing the recipient twice. Reusing one key for a **different** payload is a `409`, not a
+silent replay: that combination is always a bug on the caller's side, and returning the first
+message would hide it while dropping the second email.
+
+```bash
+curl -X POST localhost:4004/api/v1/emails \
+  -H 'content-type: application/json' \
+  -H 'idempotency-key: verify:9f3c…' \
+  -d '{"recipient":"ada@example.com","subject":"Your code","body":"123456","source":"auth.email-verification"}'
+```
+
+`source` is slug-shaped (`auth.email-verification`, `order.confirmed`) rather than free text so
+the column stays groupable — free text degrades into a hundred spellings of one origin and the
+column stops being worth querying.
+
+### Auth service (`:4005/api/v1`)
+
+Logins, sessions and verification codes. Owns no profile — see
+[services/auth/README.md](services/auth/README.md) for the full design.
+
+| Method | Path                    | Auth          | Notes                                                     |
+| ------ | ----------------------- | ------------- | --------------------------------------------------------- |
+| `POST` | `/auth/register`        | —             | `201`. Body carries the profile the user service will need |
+| `POST` | `/auth/verify-email`    | —             | `200` + tokens; creates the profile in the user service    |
+| `POST` | `/auth/resend-verification` | —         | `202` **always** — see below                              |
+| `POST` | `/auth/login`           | —             | `200` + tokens                                            |
+| `POST` | `/auth/refresh`         | refresh token | Rotates; deliberately not behind the access-token guard    |
+| `POST` | `/auth/logout`          | refresh token | `204`, idempotent                                         |
+| `POST` | `/auth/forgot-password` | —             | `202` **always**                                          |
+| `POST` | `/auth/reset-password`  | code          | Revokes every session                                     |
+| `GET`  | `/auth/me`              | access token  |                                                           |
+| `POST` | `/auth/change-password` | access token  | Requires the current password too                         |
+| `GET`  | `/auth/sessions`        | access token  | Live sessions, current one flagged                        |
+| `POST` | `/auth/logout-all`      | access token  |                                                           |
+| `GET`  | `/auth/login-history`   | access token  | Paginated; `?outcome=`, `?success=`                       |
+
+`/refresh` and `/logout` are authenticated by the refresh token in the body rather than by the
+access-token guard. Requiring a valid access token would make them useless exactly when they
+are needed — after that token has expired.
+
+**Two token types, on purpose.** The access token is a signed JWT: verifying it is pure
+computation, so any service can check it on every request without a database. The price is that
+it cannot be revoked, so it lives 15 minutes. The refresh token is the opposite — an opaque
+random string with no claims and no signature, useful only as a lookup key into
+`refresh_tokens`. That is what makes it revocable, and revocation is why the *long-lived*
+credential is the one with a row behind it.
+
+**Rotation and reuse detection.** Every refresh mints a new token and kills the one presented.
+So a **dead** token presented again means two copies were in circulation, and there is no way
+to tell which one just called — the whole family is revoked and everyone signs in again.
+
+```
+login ──► T1 (family F)
+          T1 ──refresh──► T2   T1 revoked ROTATED
+          T2 ──refresh──► T3   T2 revoked ROTATED
+          T1 ──refresh──► ✗    two copies existed
+                               └─► every token in family F revoked REUSE_DETECTED
+```
+
+**The service never confirms whether an address has an account.** Login, resend and
+forgot-password answer identically whether or not it exists — including in *timing*, which is
+why a login for an unknown address still runs an argon2 hash before answering. An endpoint that
+distinguishes them is a free membership oracle: point it at a leaked address list and it sorts
+your users out of it. The client is told "invalid email or password" for every credential
+failure while `login_history` records which it really was, because an operator investigating a
+lockout needs the distinction and an attacker must not have it.
+
+Registration is the one deliberate exception — a duplicate email is a `409`. The alternative
+makes the sign-up form unusable for everyone who simply forgot they had an account.
+
 ### Health endpoints
 
 `GET /api/v1/health` and `/health/live` report process liveness (no I/O).
@@ -527,7 +725,7 @@ into the same sink, at `warn` for 4xx and `error` for 5xx.
 ## Testing
 
 ```bash
-pnpm test               # both services
+pnpm test               # every package
 pnpm test:watch
 pnpm --filter @services/inventory test:coverage
 ```
@@ -546,6 +744,21 @@ The HTTP client is covered separately in `tests/unit/inventory.client.test.ts`, 
 throwaway `node:http` server: envelope unwrapping, header propagation, `204`, `404 → null`,
 status mapping, connection-refused and timeout. The fake proves the orchestration; only a real
 socket proves the wire format.
+
+The auth service leans on the same idea hardest, because what is worth testing there is
+*policy*: does a lockout actually lock, does a reused refresh token really cut the whole
+family, do two different failures really produce byte-identical responses. None of that needs a
+real Postgres to be wrong. Its `InMemoryAuthRepository` reproduces the concurrency guards the
+Prisma one relies on — `status: PENDING` when consuming a code, `revokedAt: null` when rotating
+a token — so those paths are exercised rather than assumed. `StubEmailClient` captures the mail
+and exposes `codeFor(recipient)`, which is the only honest way to drive a verification flow end
+to end: the plaintext code exists nowhere else by design, and a test that read it from the
+database would be asserting a property the real system deliberately does not have.
+
+Argon2 at production cost would dominate a suite containing dozens of logins, so
+`tests/setup.ts` lowers the cost parameters. The hashing itself is covered separately in
+`tests/unit/crypto.test.ts`, which also pins the JWT behaviour that matters: a tampered payload
+is rejected, an `alg: none` token is rejected, and every failure mode returns the same message.
 
 ## Validation
 
@@ -574,6 +787,65 @@ Beyond the shared keys (`PORT`, `DATABASE_URL`, `LOG_LEVEL`, `CORS_ORIGINS`, `BO
 
 Keep the timeout well under the gateway's `PROXY_TIMEOUT_MS`: a slow inventory service should
 degrade product reads to `stockStatus: UNKNOWN`, not hold connections until the caller gives up.
+
+The **user service** adds nothing — the shared keys are its whole configuration. That is a fair
+summary of the service: it stores profiles and talks to no one.
+
+The **email service** adds a provider, message limits, and the dispatcher:
+
+| Variable                      | Default                   | Purpose                                              |
+| ----------------------------- | ------------------------- | ---------------------------------------------------- |
+| `EMAIL_PROVIDER`              | `console`                 | `console` or `resend`; adding one is a case in `providers/index.ts` |
+| `EMAIL_FROM`                  | `onboarding@resend.dev`   | Sender; Resend rejects an unverified domain           |
+| `RESEND_API_KEY`              | —                         | Required when `EMAIL_PROVIDER=resend`                 |
+| `EMAIL_MAX_BODY_CHARS`        | `100000`                  | Body cap, enforced in the schema so it is a `422`     |
+| `EMAIL_MAX_ATTEMPTS`          | `5`                       | Copied onto each row at enqueue time                  |
+| `DISPATCHER_ENABLED`          | `true`                    | `false` runs the API as a pure writer; `pnpm dispatch` separately |
+| `DISPATCHER_POLL_INTERVAL_MS` | `5000`                    | Claim cycle period                                    |
+| `DISPATCHER_BATCH_SIZE`       | `25`                      | Rows per cycle, so one worker cannot starve the rest   |
+| `DISPATCHER_CONCURRENCY`      | `5`                       | Sends in flight within a batch                        |
+| `DISPATCHER_CLAIM_TIMEOUT_MS` | `120000`                  | How long a claim is honoured before the row is reclaimed |
+| `RETRY_BACKOFF_BASE_MS`       | `2000`                    | Doubles per attempt, plus jitter                      |
+| `RETRY_BACKOFF_MAX_MS`        | `900000`                  | Backoff ceiling                                       |
+| `EMAIL_RETENTION_DAYS`        | `30`                      | Purge `SENT` rows; `0` disables                       |
+
+`DISPATCHER_CLAIM_TIMEOUT_MS` must exceed `EMAIL_PROVIDER_TIMEOUT_MS`, and the env schema
+refuses to boot if it does not: a claim that expires while a send is still in flight lets a
+second worker pick the row up and deliver the same message twice.
+
+The **auth service** adds signing keys, hashing cost, and the two upstreams:
+
+| Variable                       | Default                 | Purpose                                              |
+| ------------------------------ | ----------------------- | ---------------------------------------------------- |
+| `JWT_SECRET`                   | **none — required**     | HS256 signing key, minimum 32 characters              |
+| `JWT_ISSUER` / `JWT_AUDIENCE`  | `auth-service` / `practical-microservice` | Written to `iss`/`aud` and checked on every verify |
+| `ACCESS_TOKEN_TTL_MINUTES`     | `15`                    | Exactly how long a stolen access token keeps working  |
+| `REFRESH_TOKEN_TTL_DAYS`       | `30`                    | Session lifetime without a refresh                    |
+| `ARGON2_MEMORY_COST_KIB`       | `19456`                 | OWASP's second recommended argon2id configuration     |
+| `ARGON2_TIME_COST`             | `2`                     |                                                       |
+| `ARGON2_PARALLELISM`           | `1`                     |                                                       |
+| `PASSWORD_MIN_LENGTH`          | `10`                    | Length is the control that matters (NIST SP 800-63B)  |
+| `PASSWORD_MAX_LENGTH`          | `128`                   | Bounds hashing cost — an unbounded field is a DoS     |
+| `VERIFICATION_CODE_TTL_MINUTES`| `15`                    |                                                       |
+| `VERIFICATION_MAX_ATTEMPTS`    | `5`                     | Wrong guesses before the code is burned               |
+| `VERIFICATION_RESEND_COOLDOWN_SECONDS` | `60`            | Without it, "resend" is an open mail relay            |
+| `MAX_FAILED_LOGIN_ATTEMPTS`    | `5`                     |                                                       |
+| `ACCOUNT_LOCK_DURATION_MINUTES`| `15`                    | Time-bounded, not permanent — see below               |
+| `EMAIL_SERVICE_URL`            | `http://localhost:4004` | Where verification mail is enqueued                   |
+| `USER_SERVICE_URL`             | `http://localhost:4003` | Where the profile is created                          |
+| `EMAIL_TIMEOUT_MS` / `USER_TIMEOUT_MS` | `3000`          | Per-request budget for each                           |
+| `APP_NAME`                     | `Practical Microservice`| Product name in outbound mail                         |
+
+`JWT_SECRET` has no default in any environment, including development, and the service exits at
+boot without it. A fallback here would be the most dangerous line in the repo: a deploy that
+forgot to set it would come up healthy and sign real tokens with a key published on GitHub.
+
+Argon2's cost parameters are encoded inside every digest it produces, so raising them later
+needs no migration and no re-hash — existing passwords keep verifying under the settings they
+were made with, and each is upgraded the next time its owner changes it.
+
+`ACCOUNT_LOCK_DURATION_MINUTES` expires on purpose. A lock only an operator can clear hands
+anyone who knows an email address a way to lock its owner out on demand.
 
 The gateway has no `DATABASE_URL` or `BODY_LIMIT` — it is stateless and parses no bodies — and
 adds:
@@ -604,6 +876,18 @@ callers share a bucket rather than escaping one.
 - The services enable `trust proxy` for accurate client IPs behind the gateway or an ingress;
   the gateway scopes it via `TRUST_PROXY` because its rate limiter keys on `req.ip`.
 - Only the gateway needs to be publicly reachable. The services should be bound to an internal
-  network — nothing in them authenticates a caller, and `x-actor-id` is trusted on arrival.
+  network — `x-actor-id` is trusted on arrival, so anything that can reach them can claim to be
+  anyone. The auth service is a partial exception: its `/me`, `/sessions`, `/logout-all`,
+  `/login-history` and `/change-password` routes verify a real signed token. Every other
+  service still authenticates nobody.
 - `helmet` sets security headers; CORS origins come from `CORS_ORIGINS` (`*`, or a
   comma-separated allow-list).
+- **`JWT_SECRET` must differ per environment.** `iss`/`aud` are checked on every verification,
+  so a staging token is rejected in production even if the key leaked across — but that is a
+  second line of defence, not a reason to share one.
+- `argon2` is a native module. Build and run on the same platform, or make sure the image's
+  install step can fetch a prebuilt binary for the target architecture.
+- The email dispatcher can run inside the API process (`DISPATCHER_ENABLED=true`, the default)
+  or as its own deployment (`pnpm --filter @services/email dispatch`). Both use the same claim
+  query, so they can also run side by side — which is what makes moving delivery out of the API
+  a deployment decision rather than a code change.

@@ -1,0 +1,324 @@
+// Auth service owns this schema exclusively.
+// Database-per-service is emulated with a dedicated Postgres schema:
+// DATABASE_URL=postgresql://.../db?schema=auth
+//
+// This service owns the *login*, never the *profile*. It stores what is needed
+// to prove who someone is — a password hash, a verification state, a session —
+// and nothing else. Name, address and phone belong to the user service, and
+// the only reason they appear here at all is `AuthUser.pendingProfile`, which
+// is a parking space for data in transit, cleared the moment it is handed on.
+//
+// Nothing here has a foreign key to another service's table. `AuthUser.userId`
+// is a soft reference to the user service's `users.id`, deliberately not a
+// constraint: that row lives in another schema whose lifecycle is not ours.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+  runtime      = "nodejs"
+}
+
+// `url` is the pooled endpoint the running service uses. `directUrl` is the
+// unpooled one, used only by migrate/introspect.
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/// Coarse permission tier, stamped into the access token as the `role` claim.
+/// Deliberately a small closed set rather than a permissions table: this is a
+/// teaching repo, and role-per-user is the shape most services actually start
+/// with. Anything finer belongs in a separate authorisation service.
+enum Role {
+  USER
+  ADMIN
+}
+
+/// Whether the account may authenticate at all — orthogonal to `verified`.
+///
+/// `verified` answers "did they prove they own the mailbox"; `status` answers
+/// "is this account allowed to exist". A verified account can be SUSPENDED, and
+/// an unverified one is still ACTIVE — it simply cannot log in yet. Collapsing
+/// the two into one column would make "suspended" and "never confirmed"
+/// indistinguishable, and they call for very different messages to the user.
+enum AuthUserStatus {
+  /// Normal. Login is allowed once `verified` is also true.
+  ACTIVE
+  /// Blocked by an operator. Login is refused regardless of `verified`.
+  SUSPENDED
+  /// Soft-deleted. The row is kept so the email/username stay reserved and the
+  /// login history keeps pointing at something real.
+  DELETED
+}
+
+/// What a verification code is for. The type decides which template the email
+/// service is asked to send and what consuming the code actually does.
+enum VerificationType {
+  /// Confirms a new registration. Consuming it flips `verified` and triggers
+  /// profile creation in the user service.
+  EMAIL_VERIFICATION
+  /// Authorises a password reset for someone who cannot log in.
+  PASSWORD_RESET
+  /// Confirms ownership of a *new* address before it replaces the current one.
+  /// The address being moved to is held in `Verification.newEmail`.
+  EMAIL_CHANGE
+}
+
+/// Lifecycle of one code. Every transition out of PENDING is terminal — a code
+/// is used once and never returns to circulation.
+///
+/// PENDING -> VERIFIED  (correct code presented in time)
+///         -> EXPIRED   (`expiresAt` passed, or attempts exhausted)
+///         -> REVOKED   (superseded by a resend, or the account changed under it)
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  EXPIRED
+  REVOKED
+}
+
+/// Why a login attempt ended the way it did.
+///
+/// Recorded in full even though the *response* to the client is deliberately
+/// vague. "No such email" and "wrong password" must look identical from
+/// outside — telling them apart turns the login form into an account
+/// enumeration oracle — but an operator investigating a lockout needs to know
+/// which one it was, so the distinction lives here instead.
+enum LoginOutcome {
+  SUCCESS
+  /// The email matched an account; the password did not.
+  INVALID_CREDENTIALS
+  /// No account for that email. Recorded with a null `authUserId`.
+  UNKNOWN_EMAIL
+  /// Correct password, but the mailbox was never confirmed.
+  NOT_VERIFIED
+  /// Correct password, but too many recent failures had locked the account.
+  ACCOUNT_LOCKED
+  /// Correct password, but the account is SUSPENDED or DELETED.
+  ACCOUNT_INACTIVE
+}
+
+/// Why a refresh token stopped being valid. Kept because "this session ended"
+/// and "this session was stolen" look the same in the data otherwise.
+enum RevokeReason {
+  /// Normal rotation: the token was exchanged for a successor.
+  ROTATED
+  /// The user logged out of this session.
+  LOGOUT
+  /// The user logged out everywhere, or an operator cut all sessions.
+  LOGOUT_ALL
+  /// A password change invalidated every existing session.
+  PASSWORD_CHANGED
+  /// An already-rotated token was presented again — see `RefreshToken.familyId`.
+  REUSE_DETECTED
+}
+
+/// A login. One row per set of credentials, not per human.
+model AuthUser {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Stored lower-cased. Unique, and the identifier used to log in.
+  email String @unique @db.VarChar(320)
+  /// Also unique and also lower-cased, but only a display/lookup handle —
+  /// authentication goes through `email`.
+  username String @unique @db.VarChar(50)
+
+  /// Argon2id digest. The column is named for what it holds so that no one
+  /// ever reads a line of code that appears to compare a plaintext password.
+  /// An argon2id encoded hash is ~95 chars; 255 leaves room for a parameter
+  /// change without a migration.
+  passwordHash String @map("password_hash") @db.VarChar(255)
+
+  role   Role           @default(USER)
+  status AuthUserStatus @default(ACTIVE)
+
+  /// True once an EMAIL_VERIFICATION code has been consumed. Login is refused
+  /// while this is false.
+  verified   Boolean   @default(false)
+  verifiedAt DateTime? @map("verified_at")
+
+  // ---- Profile hand-off -----------------------------------------------------
+
+  /// The user service's `users.id`, filled in once the profile has been
+  /// created. Null means the profile does not exist yet — either the account
+  /// is unverified, or the call to the user service failed and needs retrying.
+  ///
+  /// Soft reference: no foreign key, because that row is in another service's
+  /// schema. Unique so a repeated hand-off cannot attach two profiles to one
+  /// login.
+  userId String? @unique @map("user_id")
+
+  /// Name, address and phone, collected at registration and held here until
+  /// the account is verified — at which point they are posted to the user
+  /// service and this column is nulled out.
+  ///
+  /// Json rather than three columns on purpose: this service does not own
+  /// these fields, must never query or validate them beyond passing them on,
+  /// and should not need a migration when the user service adds a fourth. The
+  /// shape is enforced at the edge by Zod, not by the database.
+  pendingProfile Json? @map("pending_profile")
+
+  // ---- Brute-force protection ----------------------------------------------
+
+  /// Consecutive failed logins. Reset to zero by any success.
+  failedLoginAttempts Int @default(0) @map("failed_login_attempts")
+  /// Set once the failure count crosses the configured threshold. Login is
+  /// refused until this passes, even with the correct password.
+  lockedUntil         DateTime? @map("locked_until")
+
+  lastLoginAt       DateTime? @map("last_login_at")
+  /// Audit breadcrumb. The actual session invalidation on a password change is
+  /// done by revoking the refresh tokens, not by comparing against this.
+  passwordChangedAt DateTime? @map("password_changed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  verifications  Verification[]
+  loginHistory   LoginHistory[]
+  refreshTokens  RefreshToken[]
+
+  /// The unverified-account sweep, and any "who registered this week" question.
+  @@index([createdAt])
+  @@index([status])
+  @@map("auth_users")
+}
+
+/// A one-time code issued to prove control of a mailbox.
+model Verification {
+  id String @id @default(uuid()) @db.Uuid
+
+  authUserId String   @map("auth_user_id") @db.Uuid
+  authUser   AuthUser @relation(fields: [authUserId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 of the six digits, never the digits themselves.
+  ///
+  /// Argon2 would be wrong here despite being right for passwords: a code is
+  /// six digits from a 10^6 space and lives for fifteen minutes, so a slow hash
+  /// buys nothing an attacker cannot brute-force offline anyway — the attempt
+  /// counter and the expiry are what actually protect it. SHA-256 keeps a
+  /// leaked database row from being directly replayable, which is the whole
+  /// job, at a cost that lets `verify` stay fast.
+  codeHash String @map("code_hash") @db.VarChar(64)
+
+  type   VerificationType
+  status VerificationStatus @default(PENDING)
+
+  /// Only set for EMAIL_CHANGE: the address the account moves to when this
+  /// code is consumed. Null for every other type.
+  newEmail String? @map("new_email") @db.VarChar(320)
+
+  /// Wrong codes submitted so far. At `maxAttempts` the row goes EXPIRED, so
+  /// guessing costs the attacker a fresh email round-trip every few tries.
+  attempts    Int @default(0)
+  /// Copied from config at issue time, so raising the limit later does not
+  /// revive codes already burned through.
+  maxAttempts Int @default(5) @map("max_attempts")
+
+  issuedAt   DateTime  @default(now()) @map("issued_at")
+  expiresAt  DateTime  @map("expires_at")
+  verifiedAt DateTime? @map("verified_at")
+
+  /// The email service's message id for the mail carrying this code. Null when
+  /// the enqueue failed — which is exactly the case worth finding later, since
+  /// the user is sitting there waiting for a code that was never sent.
+  emailMessageId String? @map("email_message_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  /// The hot path: "the newest PENDING code of this type for this account".
+  @@index([authUserId, type, status])
+  /// The expiry sweep.
+  @@index([status, expiresAt])
+  @@map("verifications")
+}
+
+/// Append-only record of every login attempt, successful or not.
+///
+/// Never updated after insert. It is the answer to "was that you logging in
+/// from Lagos at 3am", and an audit trail that gets edited is not one.
+model LoginHistory {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Null when the attempt named an email with no account behind it. The row
+  /// is still written — a burst of UNKNOWN_EMAIL attempts from one IP is a
+  /// credential-stuffing run, and dropping those rows hides the attack.
+  authUserId String?   @map("auth_user_id") @db.Uuid
+  authUser   AuthUser? @relation(fields: [authUserId], references: [id], onDelete: Cascade)
+
+  /// The address as submitted (lower-cased). Kept even when `authUserId` is
+  /// set, because an account can change its email and this must still say what
+  /// was actually typed that day.
+  email String @db.VarChar(320)
+
+  success Boolean
+  outcome LoginOutcome
+
+  /// Which consecutive attempt this was for the account — 1 for a first try,
+  /// 5 for the one that trips the lock. Snapshotted per row so the sequence
+  /// stays readable without recomputing it from timestamps.
+  attempt Int @default(1)
+
+  /// Client address, taken from `req.ip` with `trust proxy` on. 45 chars fits
+  /// a full IPv6 address including an IPv4-mapped form.
+  ip String? @db.VarChar(45)
+  /// Truncated at the edge; browsers send long strings and this is a
+  /// fingerprint, not a document.
+  userAgent String? @map("user_agent") @db.VarChar(512)
+
+  loginAt DateTime @default(now()) @map("login_at")
+
+  /// "Recent activity on my account", newest first.
+  @@index([authUserId, loginAt])
+  /// Finds a stuffing run against many accounts from one source.
+  @@index([email, loginAt])
+  @@index([ip, loginAt])
+  @@map("login_history")
+}
+
+/// One live session. Presenting the token it hashes to buys a new access token.
+model RefreshToken {
+  id String @id @default(uuid()) @db.Uuid
+
+  authUserId String   @map("auth_user_id") @db.Uuid
+  authUser   AuthUser @relation(fields: [authUserId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 of the opaque token. The token itself is returned to the client
+  /// once, at issue, and never stored — a dump of this table grants nothing.
+  /// Unique, so a lookup is an index seek and a collision is impossible.
+  tokenHash String @unique @map("token_hash") @db.VarChar(64)
+
+  /// Groups a login and every token rotated from it.
+  ///
+  /// This is what makes theft detectable. Rotation means a used token is dead
+  /// the moment its successor is issued, so if a dead token is ever presented
+  /// again there are two copies in circulation — the legitimate client's and
+  /// someone else's. Which of the two is the thief is unknowable, so the
+  /// entire family is revoked and both are forced to log in again.
+  familyId String @map("family_id") @db.Uuid
+
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  /// Null while live. `ROTATED` is the ordinary end of a token's life.
+  revokedReason RevokeReason? @map("revoked_reason")
+  /// The token issued in exchange for this one. Makes the chain walkable.
+  replacedById  String?       @map("replaced_by_id") @db.Uuid
+
+  /// Where this session was created from, so "sign out my other devices" can
+  /// show the user something recognisable.
+  ip        String? @db.VarChar(45)
+  userAgent String? @map("user_agent") @db.VarChar(512)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  /// Listing a user's sessions, and revoking them all at once.
+  @@index([authUserId, revokedAt])
+  /// Family-wide revocation on reuse detection.
+  @@index([familyId])
+  /// The expired-token purge.
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
