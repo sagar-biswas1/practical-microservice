@@ -5,5 +5,10 @@ packages:
 onlyBuiltDependencies:
   - "@prisma/client"
   - "@prisma/engines"
+  # Native module: its install script fetches a prebuilt binary for the current
+  # platform (and compiles from source if none matches). Without it on this
+  # list the package installs but has no addon to load, and every call into
+  # `lib/password.ts` fails at runtime rather than at install time.
+  - "argon2"
   - "esbuild"
   - "prisma"
