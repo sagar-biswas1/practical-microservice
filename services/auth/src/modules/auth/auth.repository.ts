@@ -81,6 +81,21 @@ export interface LoginHistoryPage {
   total: number;
 }
 
+/** What one refresh-token sweep removed, split by why each row was dead. */
+export interface RefreshTokenPurgeSummary {
+  expired: number;
+  revoked: number;
+}
+
+export interface RefreshTokenPurgeInput {
+  /** Tokens whose `expiresAt` is older than this are removed. */
+  expiredBefore: Date;
+  /** Revoked-but-unexpired tokens revoked before this are removed. */
+  revokedBefore: Date;
+  /** Ceiling on rows removed per pass. */
+  limit: number;
+}
+
 /**
  * Persistence boundary for authentication.
  *
@@ -159,6 +174,30 @@ export interface AuthRepository {
   revokeFamily(familyId: string, reason: RevokeReasonValue): Promise<Result<number>>;
   revokeAllForUser(authUserId: string, reason: RevokeReasonValue): Promise<Result<number>>;
   listActiveSessions(authUserId: string, now: Date): Promise<Result<RefreshToken[]>>;
+
+  // ---- Retention ----
+  /**
+   * Deletes refresh tokens that can never be accepted again.
+   *
+   * Two windows, not one. A token past `expiresAt` is worthless the moment it
+   * gets there. A *revoked* one is evidence — `REUSE_DETECTED` marks the only
+   * record this service keeps that a session was stolen — so it is held for a
+   * longer grace period before it goes too.
+   *
+   * Deliberately not done during rotation. The predecessor row is what makes
+   * reuse detection work: presenting an already-rotated token has to resolve
+   * as "found, and revoked", and deleting it on rotation would turn a theft
+   * signal into an ordinary 401. Sweeping on a schedule also collects the rows
+   * that actually accumulate — abandoned sessions, which by definition never
+   * rotate again.
+   */
+  purgeRefreshTokens(input: RefreshTokenPurgeInput): Promise<Result<RefreshTokenPurgeSummary>>;
+
+  /** Deletes settled verification codes older than `before`. */
+  purgeVerifications(before: Date, limit: number): Promise<Result<number>>;
+
+  /** Deletes login history older than `before`. */
+  purgeLoginHistory(before: Date, limit: number): Promise<Result<number>>;
 
   // ---- Password ----
   updatePassword(
@@ -578,6 +617,123 @@ export class PrismaAuthRepository implements AuthRepository {
         orderBy: { createdAt: "desc" },
       }),
     );
+  }
+
+  // ---- Retention ------------------------------------------------------------
+
+  /**
+   * Removes dead refresh tokens in two bounded passes.
+   *
+   * Bounded because this table is the one that actually grows: rotation writes
+   * a row on every refresh, so with a 15-minute access token an active client
+   * produces ~96 a day and nothing on the request path ever deletes one. The
+   * first sweep after this ships therefore runs against a table that has never
+   * been swept, and an unbounded `deleteMany` there would be the longest
+   * statement the service has ever issued — holding locks over millions of
+   * rows, on the same pool serving logins. A slice per cycle takes several
+   * passes to catch up and blocks nothing while it does.
+   *
+   * Postgres has no `LIMIT` on `DELETE`, so each pass selects ids first and
+   * deletes by primary key. The extra round trip buys the bound.
+   *
+   * Cascades from `AuthUser` already clear a deleted account's tokens; this is
+   * for the ordinary case, which is live accounts accumulating dead sessions.
+   */
+  purgeRefreshTokens(
+    input: RefreshTokenPurgeInput,
+  ): Promise<Result<RefreshTokenPurgeSummary>> {
+    return attempt(async () => {
+      const expired = await this.deleteRefreshTokensWhere(
+        { expiresAt: { lt: input.expiredBefore } },
+        input.limit,
+      );
+
+      // Restricted to rows the first pass could not have taken. A token is
+      // routinely both revoked and expired, and without this the two counts
+      // would overlap and the summary would overstate what one sweep did.
+      const revoked = await this.deleteRefreshTokensWhere(
+        {
+          revokedAt: { lt: input.revokedBefore },
+          expiresAt: { gte: input.expiredBefore },
+        },
+        input.limit,
+      );
+
+      return { expired, revoked };
+    });
+  }
+
+  /** Selects up to `limit` matching ids, then deletes exactly those rows. */
+  private async deleteRefreshTokensWhere(
+    where: Prisma.RefreshTokenWhereInput,
+    limit: number,
+  ): Promise<number> {
+    const rows = await this.prisma.refreshToken.findMany({
+      where,
+      select: { id: true },
+      take: limit,
+    });
+    if (rows.length === 0) return 0;
+
+    const { count } = await this.prisma.refreshToken.deleteMany({
+      where: { id: { in: rows.map((row) => row.id) } },
+    });
+    return count;
+  }
+
+  /**
+   * Removes verification codes that are settled and past `before`.
+   *
+   * PENDING rows are left alone whatever their age. A code still in flight is
+   * live state, and the sweep must never be the reason someone's verification
+   * stops working — rows leave PENDING on their own when consumed, when the
+   * attempt ceiling burns them, or when a resend supersedes them.
+   *
+   * Filtered on `expiresAt` rather than `updatedAt` so the existing
+   * `[status, expiresAt]` index covers it. That index was added for this.
+   */
+  purgeVerifications(before: Date, limit: number): Promise<Result<number>> {
+    return attempt(async () => {
+      const rows = await this.prisma.verification.findMany({
+        where: {
+          status: { in: ["VERIFIED", "EXPIRED", "REVOKED"] },
+          expiresAt: { lt: before },
+        },
+        select: { id: true },
+        take: limit,
+      });
+      if (rows.length === 0) return 0;
+
+      const { count } = await this.prisma.verification.deleteMany({
+        where: { id: { in: rows.map((row) => row.id) } },
+      });
+      return count;
+    });
+  }
+
+  /**
+   * Removes login history past the retention window.
+   *
+   * Held far longer than the tokens, and disableable, because this is the
+   * audit trail rather than housekeeping — how long it is kept is a policy
+   * decision that some deployments make somewhere other than this repo. It is
+   * still bounded, though: a row is written per *failed* login too, so the
+   * table grows fastest exactly when the service is under attack.
+   */
+  purgeLoginHistory(before: Date, limit: number): Promise<Result<number>> {
+    return attempt(async () => {
+      const rows = await this.prisma.loginHistory.findMany({
+        where: { loginAt: { lt: before } },
+        select: { id: true },
+        take: limit,
+      });
+      if (rows.length === 0) return 0;
+
+      const { count } = await this.prisma.loginHistory.deleteMany({
+        where: { id: { in: rows.map((row) => row.id) } },
+      });
+      return count;
+    });
   }
 
   // ---- Password -------------------------------------------------------------

@@ -276,6 +276,9 @@ model LoginHistory {
   /// Finds a stuffing run against many accounts from one source.
   @@index([email, loginAt])
   @@index([ip, loginAt])
+  /// The retention sweep, which selects by age alone. Every composite index
+  /// above leads with a different column, so none of them can serve it.
+  @@index([loginAt])
   @@map("login_history")
 }
 
