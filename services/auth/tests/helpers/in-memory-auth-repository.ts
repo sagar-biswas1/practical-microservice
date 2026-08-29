@@ -10,6 +10,8 @@ import type {
   NewRefreshTokenRecord,
   NewVerificationRecord,
   RefreshToken,
+  RefreshTokenPurgeInput,
+  RefreshTokenPurgeSummary,
   Verification,
 } from "../../src/modules/auth/auth.repository.js";
 import type {
@@ -94,6 +96,60 @@ export class InMemoryAuthRepository implements AuthRepository {
 
   peekLogins(): LoginHistory[] {
     return [...this.logins];
+  }
+
+  get verificationCount(): number {
+    return this.verifications.size;
+  }
+
+  get refreshTokenCount(): number {
+    return this.refreshTokens.size;
+  }
+
+  /**
+   * Inserts a refresh token with arbitrary timestamps.
+   *
+   * The ordinary write path stamps `createdAt`/`revokedAt` from the clock,
+   * which is fine for the policy tests but useless for retention: those turn
+   * entirely on rows being *old*, and waiting thirty days for one is not a
+   * test strategy.
+   */
+  seedRefreshToken(overrides: Partial<RefreshToken> = {}): RefreshToken {
+    const now = new Date();
+    const row: RefreshToken = {
+      id: randomUUID(),
+      authUserId: randomUUID(),
+      tokenHash: randomUUID().replace(/-/g, "").padEnd(64, "0"),
+      familyId: randomUUID(),
+      expiresAt: now,
+      revokedAt: null,
+      revokedReason: null,
+      replacedById: null,
+      ip: null,
+      userAgent: null,
+      createdAt: now,
+      ...overrides,
+    };
+    this.refreshTokens.set(row.id, row);
+    return row;
+  }
+
+  /** Inserts login history at an arbitrary `loginAt`. See `seedRefreshToken`. */
+  seedLoginHistory(overrides: Partial<LoginHistory> = {}): LoginHistory {
+    const row: LoginHistory = {
+      id: randomUUID(),
+      authUserId: null,
+      email: "seed@example.com",
+      success: false,
+      outcome: "UNKNOWN_EMAIL",
+      attempt: 1,
+      ip: null,
+      userAgent: null,
+      loginAt: new Date(),
+      ...overrides,
+    };
+    this.logins.push(row);
+    return row;
   }
 
   private outage<T>(method: RepositoryMethod): Result<T> | null {
@@ -397,6 +453,60 @@ export class InMemoryAuthRepository implements AuthRepository {
     );
   }
 
+  // ---- Retention ------------------------------------------------------------
+
+  async purgeRefreshTokens(
+    input: RefreshTokenPurgeInput,
+  ): Promise<Result<RefreshTokenPurgeSummary>> {
+    const outage = this.outage<RefreshTokenPurgeSummary>("purgeRefreshTokens");
+    if (outage) return outage;
+
+    const expired = this.deleteRefreshTokensWhere(
+      (token) => token.expiresAt < input.expiredBefore,
+      input.limit,
+    );
+
+    // Mirrors the real query: the second pass only sees what the first could
+    // not have taken, so a token that is both revoked and expired is counted
+    // once.
+    const revoked = this.deleteRefreshTokensWhere(
+      (token) =>
+        token.revokedAt !== null &&
+        token.revokedAt < input.revokedBefore &&
+        token.expiresAt >= input.expiredBefore,
+      input.limit,
+    );
+
+    return ok({ expired, revoked });
+  }
+
+  async purgeVerifications(before: Date, limit: number): Promise<Result<number>> {
+    const outage = this.outage<number>("purgeVerifications");
+    if (outage) return outage;
+
+    let deleted = 0;
+    for (const [id, row] of this.verifications) {
+      if (deleted >= limit) break;
+      if (row.status === "PENDING" || row.expiresAt >= before) continue;
+      this.verifications.delete(id);
+      deleted += 1;
+    }
+    return ok(deleted);
+  }
+
+  async purgeLoginHistory(before: Date, limit: number): Promise<Result<number>> {
+    const outage = this.outage<number>("purgeLoginHistory");
+    if (outage) return outage;
+
+    let deleted = 0;
+    for (let i = this.logins.length - 1; i >= 0 && deleted < limit; i -= 1) {
+      if (this.logins[i]!.loginAt >= before) continue;
+      this.logins.splice(i, 1);
+      deleted += 1;
+    }
+    return ok(deleted);
+  }
+
   // ---- Password -------------------------------------------------------------
 
   async updatePassword(
@@ -451,6 +561,20 @@ export class InMemoryAuthRepository implements AuthRepository {
     };
     this.refreshTokens.set(created.id, created);
     return created;
+  }
+
+  private deleteRefreshTokensWhere(
+    predicate: (token: RefreshToken) => boolean,
+    limit: number,
+  ): number {
+    let deleted = 0;
+    for (const [id, token] of this.refreshTokens) {
+      if (deleted >= limit) break;
+      if (!predicate(token)) continue;
+      this.refreshTokens.delete(id);
+      deleted += 1;
+    }
+    return deleted;
   }
 
   private revokeWhere(

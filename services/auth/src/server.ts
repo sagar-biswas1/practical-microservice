@@ -4,10 +4,11 @@ import { env } from "./config/env.js";
 import { buildContainer } from "./container.js";
 import { logger } from "./lib/logger.js";
 import { checkDatabaseConnection, prisma } from "./lib/prisma.js";
+import type { AuthReaper } from "./modules/auth/auth.reaper.js";
+
+const { service, reaper } = buildContainer();
 
 function buildServer() {
-  const { service } = buildContainer();
-
   return createApp({
     authService: service,
     checkReadiness: () => checkDatabaseConnection(prisma),
@@ -15,10 +16,16 @@ function buildServer() {
 }
 
 /**
- * Drains in-flight requests, then closes the database pool. If either stalls,
- * the timeout forces exit so a stuck connection can't block a rolling deploy.
+ * Drains in-flight requests, stops the retention sweep, then closes the
+ * database pool. If any of that stalls, the timeout forces exit so a stuck
+ * connection can't block a rolling deploy.
+ *
+ * The reaper is stopped after the HTTP server, and awaited rather than killed,
+ * so a bounded delete already in flight commits instead of being cut off — a
+ * sweep interrupted mid-statement would roll back and repeat the same slice on
+ * the next instance anyway.
  */
-function registerShutdownHandlers(server: Server): void {
+function registerShutdownHandlers(server: Server, worker: AuthReaper): void {
   let shuttingDown = false;
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -37,6 +44,7 @@ function registerShutdownHandlers(server: Server): void {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
+      await worker.stop();
       await prisma.$disconnect();
       logger.info("shutdown_complete");
       clearTimeout(forceExit);
@@ -79,7 +87,10 @@ function start(): void {
     process.exit(1);
   });
 
-  registerShutdownHandlers(server);
+  registerShutdownHandlers(server, reaper);
+
+  // Off when a scheduler drives `runOnce` instead — see `reap.ts`.
+  if (env.REAPER_ENABLED) reaper.start();
 }
 
 start();

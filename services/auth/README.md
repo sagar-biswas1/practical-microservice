@@ -180,6 +180,59 @@ service layer, but only one matches in the database. The other updates zero
 rows and mints nothing — so "a used token was presented again" is genuine theft
 evidence, not a race between two browser tabs.
 
+## Retention
+
+Rotation writes a row on **every** refresh and nothing on the request path ever
+deletes one. With a 15-minute access token that is ~96 rows a day per active
+client, forever, in the one table whose unique index is on the hot path of every
+refresh. `AuthReaper` sweeps it on a schedule (hourly by default), along with
+settled verification codes and aged login history.
+
+**Why not delete during rotation, which looks cheaper:**
+
+- **The predecessor row is load-bearing.** Reuse detection works by finding an
+  already-rotated token and seeing that it is revoked. Delete it at rotation
+  time and a stolen token reads as merely unknown — you trade the one signal
+  that a session was stolen for a plain 401, and the thief's session keeps
+  running.
+- **Opportunistic cleanup has inverted coverage.** The rows that accumulate are
+  from sessions nobody came back to, and those never rotate again. Users who
+  refresh constantly would pay to clean up after users who left, while the
+  abandoned rows stayed forever.
+- **Rotation is the wrong place for undeadlined work.** It is the most
+  latency-sensitive write in the service and already runs a transaction
+  resolving a real race between concurrent clients.
+
+Two windows, not one, because the rows are not equally worthless:
+
+| Row | Kept | Why |
+| --- | --- | --- |
+| Expired token | `REFRESH_TOKEN_EXPIRED_GRACE_DAYS` (1) | Past `expiresAt` it can never be accepted again; the grace only keeps the recent past readable |
+| Revoked token | `REFRESH_TOKEN_REVOKED_RETENTION_DAYS` (30) | A `REUSE_DETECTED` family is the only record that a session was stolen, and that investigation rarely starts the same day |
+| Settled verification | `VERIFICATION_RETENTION_DAYS` (7) | `PENDING` rows are live state and are **never** swept, whatever their age |
+| Login history | `LOGIN_HISTORY_RETENTION_DAYS` (180) | The audit trail. `0` disables it, for deployments whose retention rules live elsewhere |
+
+Every pass is bounded by `REAPER_BATCH_SIZE`. Postgres has no `LIMIT` on
+`DELETE`, so each selects ids first and deletes by primary key — the extra round
+trip is what stops the first sweep against a never-swept table from becoming the
+longest-running statement the service has ever issued, on the pool serving
+logins. Falling behind is fine; the next cycle takes the next slice.
+
+Safe on several instances at once: these are bounded deletes of already-dead
+rows, so two workers racing over a slice just means one removes fewer rows than
+it asked for.
+
+To keep housekeeping off the API instances, set `REAPER_ENABLED=false` and run
+the sweep as a scheduled job — same `runOnce`, so the policy does not change
+with the deployment shape:
+
+```bash
+pnpm --filter @services/auth reap    # one pass, non-zero exit on failure
+```
+
+Retention bounds *disk*, not the live session count. Capping concurrent sessions
+per user is a separate control this service does not yet have.
+
 ## Lockout
 
 Five consecutive failures locks the account for 15 minutes. Two details matter:

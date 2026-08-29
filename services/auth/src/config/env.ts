@@ -120,6 +120,54 @@ const envSchema = z
      */
     ACCOUNT_LOCK_DURATION_MINUTES: z.coerce.number().int().min(1).max(1_440).default(15),
 
+    // ---- Retention sweep -----------------------------------------------------
+
+    /**
+     * Runs the background reaper inside this process.
+     *
+     * Set `false` on the API instances when the sweep is driven by a real
+     * scheduler instead (`pnpm --filter @services/auth reap` as a CronJob).
+     * Both paths call the same `runOnce`, so the retention policy does not
+     * change with the deployment shape — only who triggers it.
+     */
+    REAPER_ENABLED: z
+      .string()
+      .default("true")
+      .transform((value) => value.trim().toLowerCase() !== "false"),
+    /** Gap between sweeps. Hourly is far more often than the growth requires. */
+    REAPER_INTERVAL_MS: z.coerce.number().int().min(1_000).default(3_600_000),
+    /**
+     * Rows deleted per table per sweep. Bounded so the first run against a
+     * table that has never been swept cannot lock up the pool serving logins;
+     * it simply takes several cycles to catch up.
+     */
+    REAPER_BATCH_SIZE: z.coerce.number().int().min(1).max(50_000).default(5_000),
+
+    /**
+     * Grace period before an *expired* refresh token is deleted. Past its
+     * `expiresAt` the row can never be accepted again, so this only keeps the
+     * recent past readable while debugging a session that ended.
+     */
+    REFRESH_TOKEN_EXPIRED_GRACE_DAYS: z.coerce.number().int().min(0).max(365).default(1),
+    /**
+     * How long a *revoked* refresh token is kept. Deliberately longer than the
+     * expired grace: a `REUSE_DETECTED` family is the only record this service
+     * keeps that a session was stolen.
+     */
+    REFRESH_TOKEN_REVOKED_RETENTION_DAYS: z.coerce
+      .number()
+      .int()
+      .min(0)
+      .max(365)
+      .default(30),
+    /** How long a settled verification code is kept. `0` disables that sweep. */
+    VERIFICATION_RETENTION_DAYS: z.coerce.number().int().min(0).max(365).default(7),
+    /**
+     * How long login history is kept. `0` disables that sweep — the right
+     * setting when retention is dictated by a policy that lives elsewhere.
+     */
+    LOGIN_HISTORY_RETENTION_DAYS: z.coerce.number().int().min(0).max(3_650).default(180),
+
     // ---- Downstream services -------------------------------------------------
 
     /** Sends verification and password-reset mail. */
@@ -154,6 +202,23 @@ const envSchema = z
         message:
           "REFRESH_TOKEN_TTL_DAYS must exceed ACCESS_TOKEN_TTL_MINUTES, otherwise a session " +
           "expires before the access token it issued does",
+      });
+    }
+
+    // The reaper holds revoked tokens for one window and merely expired ones
+    // for another. Set the revoked window shorter and the intent inverts: the
+    // record of a stolen session becomes the *first* thing deleted, while rows
+    // that were only ever going to time out harmlessly are kept longer.
+    if (
+      value.REFRESH_TOKEN_REVOKED_RETENTION_DAYS < value.REFRESH_TOKEN_EXPIRED_GRACE_DAYS
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["REFRESH_TOKEN_REVOKED_RETENTION_DAYS"],
+        message:
+          "REFRESH_TOKEN_REVOKED_RETENTION_DAYS must be at least " +
+          "REFRESH_TOKEN_EXPIRED_GRACE_DAYS — a revoked token is the audit record of a " +
+          "session that was cut short, and should outlive one that merely timed out",
       });
     }
   });
