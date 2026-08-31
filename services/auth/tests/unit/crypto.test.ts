@@ -59,7 +59,7 @@ describe("password hashing", () => {
 describe("access tokens", () => {
   const claims = {
     sub: "5f9b2c1e-0000-4000-8000-000000000001",
-    email: "ada@example.com",
+    email: "delivered@resend.dev",
     username: "ada",
     role: "USER",
     sid: "5f9b2c1e-0000-4000-8000-000000000002",

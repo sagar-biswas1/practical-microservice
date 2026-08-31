@@ -11,7 +11,7 @@ import { InMemoryUserRepository } from "../helpers/in-memory-user-repository.js"
 const validInput: CreateUserInput = {
   authUserId: "auth|abc123",
   name: "Ada Lovelace",
-  email: "ada@example.com",
+  email: "delivered@resend.dev",
   address: "12 Analytical Engine Way",
   phone: "+15550001111",
 };
@@ -34,7 +34,10 @@ describe("UserService", () => {
       const [error, user] = await service.create(validInput);
 
       expect(error).toBeNull();
-      expect(user).toMatchObject({ authUserId: "auth|abc123", email: "ada@example.com" });
+      expect(user).toMatchObject({
+        authUserId: "auth|abc123",
+        email: "delivered@resend.dev",
+      });
       expect(repository.size).toBe(1);
     });
 

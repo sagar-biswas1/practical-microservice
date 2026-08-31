@@ -38,17 +38,16 @@ export function createApp(deps: AppDependencies): Express {
   // matches only `/docs` and `/openapi.json`; everything else falls straight
   // through.
   app.use(createDocsRouter());
-  app.use((req, res, next) => {
-    const protocol = req.headers["x-forwarded-proto"] || "http";
-    const host = req.headers["x-forwarded-host"];
-    const fullUrl = `${protocol}://${host}`;
-    if (Array.isArray(corsOrigins) && corsOrigins.includes(fullUrl)) {
-      next();
-    } else {
-      res.status(403).json({ error: "Forbidden" });
-    }
-  });
-
+  // app.use((req, res, next) => {
+  //   const protocol = req.headers["x-forwarded-proto"] || "http";
+  //   const host = req.headers["x-forwarded-host"];
+  //   const fullUrl = `${protocol}://${host}`;
+  //   if (Array.isArray(corsOrigins) && corsOrigins.includes(fullUrl)) {
+  //     next();
+  //   } else {
+  //     res.status(403).json({ error: "Forbidden" });
+  //   }
+  // });
 
   // Before the body parsers: a malformed-JSON error must still carry a
   // correlation id and show up in the access log.
@@ -61,7 +60,11 @@ export function createApp(deps: AppDependencies): Express {
   app.get("/", (_req, res) => {
     res.json({
       success: true,
-      data: { service: env.SERVICE_NAME, version: "1.0.0", apiPrefix: API_PREFIX },
+      data: {
+        service: env.SERVICE_NAME,
+        version: "1.0.0",
+        apiPrefix: API_PREFIX,
+      },
     });
   });
 

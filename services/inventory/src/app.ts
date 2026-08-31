@@ -46,16 +46,16 @@ export function createApp(deps: AppDependencies): Express {
   // through.
   app.use(createDocsRouter());
 
-  app.use((req, res, next) => {
-    const protocol = req.headers["x-forwarded-proto"] || "http";
-    const host = req.headers["x-forwarded-host"];
-    const fullUrl = `${protocol}://${host}`;
-    if (Array.isArray(corsOrigins) && corsOrigins.includes(fullUrl)) {
-      next();
-    } else {
-      res.status(403).json({ error: "Forbidden" });
-    }
-  });
+  // app.use((req, res, next) => {
+  //   const protocol = req.headers["x-forwarded-proto"] || "http";
+  //   const host = req.headers["x-forwarded-host"];
+  //   const fullUrl = `${protocol}://${host}`;
+  //   if (Array.isArray(corsOrigins) && corsOrigins.includes(fullUrl)) {
+  //     next();
+  //   } else {
+  //     res.status(403).json({ error: "Forbidden" });
+  //   }
+  // });
 
   // Before the body parsers: a malformed-JSON error must still carry a
   // correlation id and show up in the access log.

@@ -116,7 +116,7 @@ All paths under `/api/v1`.
 curl -X POST localhost:4004/api/v1/emails \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: welcome-user-42' \
-  -d '{"recipient":"ada@example.com","subject":"Welcome","body":"Hello","source":"user-service"}'
+  -d '{"recipient":"delivered@resend.dev","subject":"Welcome","body":"Hello","source":"user-service"}'
 ```
 
 ## Changing provider

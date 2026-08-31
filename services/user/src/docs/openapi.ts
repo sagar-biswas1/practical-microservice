@@ -59,8 +59,14 @@ export const openapiDocument: OpenApiDocument = {
     ].join("\n"),
   },
   servers: [
-    { url: "http://localhost:4000", description: "Through the api-gateway (token verified at the edge)" },
-    { url: `http://localhost:${env.PORT}`, description: "Direct — development only" },
+    {
+      url: "http://localhost:4000",
+      description: "Through the api-gateway (token verified at the edge)",
+    },
+    {
+      url: `http://localhost:${env.PORT}`,
+      description: "Direct — development only",
+    },
   ],
   tags: [
     { name: "Users", description: "Profiles." },
@@ -87,14 +93,26 @@ export const openapiDocument: OpenApiDocument = {
           example: {
             authUserId: "0f4b2c9e-6a1d-4b3e-8c7f-2d5a9e1b3c4d",
             name: "Ada Lovelace",
-            email: "ada@example.com",
+            email: "delivered@resend.dev",
             address: "12 Analytical Way, London",
             phone: "+44 20 7946 0958",
           },
         }),
         responses: {
-          "201": successResponse("The new profile.", { $ref: "#/components/schemas/User" }),
-          ...errorResponses("400", "401", "403", "409", "413", "422", "429", "500", "503"),
+          "201": successResponse("The new profile.", {
+            $ref: "#/components/schemas/User",
+          }),
+          ...errorResponses(
+            "400",
+            "401",
+            "403",
+            "409",
+            "413",
+            "422",
+            "429",
+            "500",
+            "503",
+          ),
         },
       },
     },
@@ -138,8 +156,20 @@ export const openapiDocument: OpenApiDocument = {
           example: { address: "24 Difference Engine Road, London" },
         }),
         responses: {
-          "200": successResponse("The updated profile.", { $ref: "#/components/schemas/User" }),
-          ...errorResponses("400", "401", "404", "409", "413", "422", "429", "500", "503"),
+          "200": successResponse("The updated profile.", {
+            $ref: "#/components/schemas/User",
+          }),
+          ...errorResponses(
+            "400",
+            "401",
+            "404",
+            "409",
+            "413",
+            "422",
+            "429",
+            "500",
+            "503",
+          ),
         },
       },
       delete: {

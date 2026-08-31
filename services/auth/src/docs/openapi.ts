@@ -155,14 +155,27 @@ export const openapiDocument: OpenApiDocument = {
     ].join("\n"),
   },
   servers: [
-    { url: "http://localhost:4000", description: "Through the api-gateway (credential endpoints are rate-limited there)" },
-    { url: `http://localhost:${env.PORT}`, description: "Direct — development only" },
+    {
+      url: "http://localhost:4000",
+      description:
+        "Through the api-gateway (credential endpoints are rate-limited there)",
+    },
+    {
+      url: `http://localhost:${env.PORT}`,
+      description: "Direct — development only",
+    },
   ],
   tags: [
-    { name: "Registration", description: "Creating an account and proving the mailbox." },
+    {
+      name: "Registration",
+      description: "Creating an account and proving the mailbox.",
+    },
     { name: "Sessions", description: "Logging in, refreshing, logging out." },
     { name: "Passwords", description: "Resetting and changing a password." },
-    { name: "Account", description: "What the signed-in caller can see about themselves." },
+    {
+      name: "Account",
+      description: "What the signed-in caller can see about themselves.",
+    },
     { name: "Health", description: "Liveness and readiness probes." },
     { name: "Meta", description: "Service banner." },
   ],
@@ -190,7 +203,7 @@ export const openapiDocument: OpenApiDocument = {
           "Creates the login and mails a verification code. The profile fields are validated here against the *user service's* constraints and then parked until the account verifies — so a bad address is a 422 while the user is still on the form, rather than a failed hand-off fifteen minutes later when there is no one left to correct it.\n\nPassword rules are a floor, a ceiling and a blocklist, with no composition requirements: NIST SP 800-63B recommends against those, and they mostly produce `Password1!`. The ceiling is not cosmetic — Argon2 hashes whatever it is given, so an unbounded password field is unbounded CPU per login attempt. A password containing the account's own username or email local-part is also rejected.\n\n`emailQueued: false` means the account exists but the code never reached the email service; the client should offer \"resend\" rather than leave the user waiting for mail that was never sent.",
         requestBody: jsonBody(registerSchema, {
           example: {
-            email: "ada@example.com",
+            email: "delivered@resend.dev",
             username: "ada",
             password: "correct horse battery staple",
             profile: {
@@ -208,7 +221,8 @@ export const openapiDocument: OpenApiDocument = {
               user: { $ref: "#/components/schemas/AuthUser" },
               emailQueued: {
                 type: "boolean",
-                description: "False when the verification code could not be handed to the email service.",
+                description:
+                  "False when the verification code could not be handed to the email service.",
               },
             },
           }),
@@ -226,7 +240,7 @@ export const openapiDocument: OpenApiDocument = {
         description:
           "Flips `verified`, signs the caller in, and hands the parked profile to the user service. A wrong code burns an attempt; at the ceiling the code goes `EXPIRED`, so guessing costs the attacker a fresh email round-trip every few tries.\n\n`profileCreated: false` means the account is verified and usable and only the user-service profile is missing — the next login retries it.",
         requestBody: jsonBody(verifyEmailSchema, {
-          example: { email: "ada@example.com", code: "123456" },
+          example: { email: "delivered@resend.dev", code: "123456" },
         }),
         responses: {
           "200": successResponse("Verified and signed in.", {
@@ -238,7 +252,16 @@ export const openapiDocument: OpenApiDocument = {
               profileCreated: { type: "boolean" },
             },
           }),
-          ...errorResponses("400", "401", "404", "413", "422", "429", "500", "503"),
+          ...errorResponses(
+            "400",
+            "401",
+            "404",
+            "413",
+            "422",
+            "429",
+            "500",
+            "503",
+          ),
         },
       },
     },
@@ -252,12 +275,14 @@ export const openapiDocument: OpenApiDocument = {
         description:
           "**Always `202`, whatever happened** — unknown address, already-verified account, cooldown still running. This endpoint takes an email and nothing else, so any variation in its answer is an account-existence oracle that needs no credentials to query.\n\nThe cooldown is enforced all the same, silently: it is what stops the endpoint from being used to mail an arbitrary address as fast as HTTP allows.",
         requestBody: jsonBody(resendVerificationSchema, {
-          example: { email: "ada@example.com" },
+          example: { email: "delivered@resend.dev" },
         }),
         responses: {
           "202": successResponse(
             "Accepted. Says nothing about whether the address exists.",
-            messageOnly("If that address needs verifying, a new code is on its way."),
+            messageOnly(
+              "If that address needs verifying, a new code is on its way.",
+            ),
           ),
           ...errorResponses("400", "413", "422", "429", "500", "503"),
         },
@@ -273,11 +298,23 @@ export const openapiDocument: OpenApiDocument = {
         description:
           "The password is bounded but otherwise unvalidated here. Applying the password *policy* to a login would reject an existing account whose password predates a rule change — with a 422 helpfully describing what their password looks like. The only thing that decides a login is the hash comparison.\n\nEvery attempt, successful or not, is written to the login history. Consecutive failures lock the account for a configured period, and a lock is refused even with the correct password.",
         requestBody: jsonBody(loginSchema, {
-          example: { email: "ada@example.com", password: "correct horse battery staple" },
+          example: {
+            email: "delivered@resend.dev",
+            password: "correct horse battery staple",
+          },
         }),
         responses: {
           "200": successResponse("Signed in.", authenticatedResult),
-          ...errorResponses("400", "401", "403", "413", "422", "429", "500", "503"),
+          ...errorResponses(
+            "400",
+            "401",
+            "403",
+            "413",
+            "422",
+            "429",
+            "500",
+            "503",
+          ),
         },
       },
     },
@@ -294,7 +331,9 @@ export const openapiDocument: OpenApiDocument = {
           example: { refreshToken: "8f14e45fceea467a9a5f1b8f1c2a3d4e…" },
         }),
         responses: {
-          "200": successResponse("A fresh token pair.", { $ref: "#/components/schemas/AuthTokens" }),
+          "200": successResponse("A fresh token pair.", {
+            $ref: "#/components/schemas/AuthTokens",
+          }),
           ...errorResponses("400", "401", "413", "422", "429", "500", "503"),
         },
       },
@@ -306,7 +345,8 @@ export const openapiDocument: OpenApiDocument = {
         operationId: "logout",
         security: [],
         summary: "End this session",
-        description: "Revokes the refresh token in the body. Public for the same reason `refresh` is.",
+        description:
+          "Revokes the refresh token in the body. Public for the same reason `refresh` is.",
         requestBody: jsonBody(logoutSchema, {
           example: { refreshToken: "8f14e45fceea467a9a5f1b8f1c2a3d4e…" },
         }),
@@ -325,11 +365,15 @@ export const openapiDocument: OpenApiDocument = {
         summary: "Request a password reset code",
         description:
           "**Always `202`, same body, whether or not the account exists.** This is the most attractive enumeration target in the service, because it needs no credentials at all to probe.",
-        requestBody: jsonBody(forgotPasswordSchema, { example: { email: "ada@example.com" } }),
+        requestBody: jsonBody(forgotPasswordSchema, {
+          example: { email: "delivered@resend.dev" },
+        }),
         responses: {
           "202": successResponse(
             "Accepted. Says nothing about whether the address exists.",
-            messageOnly("If that address has an account, a reset code is on its way."),
+            messageOnly(
+              "If that address has an account, a reset code is on its way.",
+            ),
           ),
           ...errorResponses("400", "413", "422", "429", "500", "503"),
         },
@@ -346,7 +390,7 @@ export const openapiDocument: OpenApiDocument = {
           "Consumes the code, writes the new hash and revokes every session in one transaction. Signing every device out is the point: if the reset was needed because someone else had the password, leaving their sessions alive would defeat it.",
         requestBody: jsonBody(resetPasswordSchema, {
           example: {
-            email: "ada@example.com",
+            email: "delivered@resend.dev",
             code: "123456",
             password: "a new and unrelated passphrase",
           },
@@ -356,7 +400,16 @@ export const openapiDocument: OpenApiDocument = {
             "Password changed and all sessions revoked.",
             messageOnly("Password updated. All sessions have been signed out."),
           ),
-          ...errorResponses("400", "401", "404", "413", "422", "429", "500", "503"),
+          ...errorResponses(
+            "400",
+            "401",
+            "404",
+            "413",
+            "422",
+            "429",
+            "500",
+            "503",
+          ),
         },
       },
     },
@@ -370,7 +423,9 @@ export const openapiDocument: OpenApiDocument = {
           "A valid token for an account that no longer exists is a 401, not a 404: the credential is the thing that is no longer good, and there is no resource to be missing.",
         ...authenticated,
         responses: {
-          "200": successResponse("The caller's account.", { $ref: "#/components/schemas/AuthUser" }),
+          "200": successResponse("The caller's account.", {
+            $ref: "#/components/schemas/AuthUser",
+          }),
           ...errorResponses("401", "429", "500", "503"),
         },
       },
@@ -405,7 +460,8 @@ export const openapiDocument: OpenApiDocument = {
         tags: ["Account"],
         operationId: "listSessions",
         summary: "Live sessions",
-        description: "Every unexpired, unrevoked refresh token for the caller. `current` marks this one.",
+        description:
+          "Every unexpired, unrevoked refresh token for the caller. `current` marks this one.",
         ...authenticated,
         responses: {
           "200": successResponse("The caller's live sessions.", {
@@ -422,7 +478,8 @@ export const openapiDocument: OpenApiDocument = {
         tags: ["Sessions"],
         operationId: "logoutAll",
         summary: "Sign out everywhere",
-        description: "Revokes every refresh token for the caller, this one included.",
+        description:
+          "Revokes every refresh token for the caller, this one included.",
         ...authenticated,
         responses: {
           "200": successResponse("How many sessions were cut.", {
@@ -440,7 +497,8 @@ export const openapiDocument: OpenApiDocument = {
         tags: ["Account"],
         operationId: "loginHistory",
         summary: "Recent login attempts",
-        description: "The caller's own attempts, newest first. Filter by outcome or by success.",
+        description:
+          "The caller's own attempts, newest first. Filter by outcome or by success.",
         ...authenticated,
         parameters: parametersFrom(loginHistoryQuerySchema, "query"),
         responses: {

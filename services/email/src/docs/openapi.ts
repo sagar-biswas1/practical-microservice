@@ -125,8 +125,14 @@ export const openapiDocument: OpenApiDocument = {
     ].join("\n"),
   },
   servers: [
-    { url: "http://localhost:4000", description: "Through the api-gateway (token verified at the edge)" },
-    { url: `http://localhost:${env.PORT}`, description: "Direct — development only" },
+    {
+      url: "http://localhost:4000",
+      description: "Through the api-gateway (token verified at the edge)",
+    },
+    {
+      url: `http://localhost:${env.PORT}`,
+      description: "Direct — development only",
+    },
   ],
   tags: [
     { name: "Outbox", description: "Enqueueing and inspecting messages." },
@@ -136,7 +142,11 @@ export const openapiDocument: OpenApiDocument = {
   ],
   components: {
     securitySchemes: { bearerAuth: bearerAuthScheme },
-    schemas: { ...commonSchemas, EmailMessage: emailMessage, StatusCounts: statusCounts },
+    schemas: {
+      ...commonSchemas,
+      EmailMessage: emailMessage,
+      StatusCounts: statusCounts,
+    },
   },
   paths: {
     "/": rootPath(env.SERVICE_NAME, {
@@ -155,7 +165,7 @@ export const openapiDocument: OpenApiDocument = {
         parameters: [idempotencyKeyParameter],
         requestBody: jsonBody(sendEmailSchema, {
           example: {
-            recipient: "ada@example.com",
+            recipient: "delivered@resend.dev",
             subject: "Verify your email address",
             body: "Your code is 123456. It expires in 15 minutes.",
             bodyType: "TEXT",
@@ -173,7 +183,17 @@ export const openapiDocument: OpenApiDocument = {
           "202": successResponse("Accepted into the outbox. Not yet sent.", {
             $ref: "#/components/schemas/EmailMessage",
           }),
-          ...errorResponses("400", "401", "403", "409", "413", "422", "429", "500", "503"),
+          ...errorResponses(
+            "400",
+            "401",
+            "403",
+            "409",
+            "413",
+            "422",
+            "429",
+            "500",
+            "503",
+          ),
         },
       },
       get: {
@@ -201,7 +221,9 @@ export const openapiDocument: OpenApiDocument = {
           "Declared before `/{id}` in the router. The id schema would reject `stats` as a non-UUID anyway, but relying on that would make the routing depend on the shape of an identifier that could change.",
         security: [{ bearerAuth: [] }],
         responses: {
-          "200": successResponse("Counts per status.", { $ref: "#/components/schemas/StatusCounts" }),
+          "200": successResponse("Counts per status.", {
+            $ref: "#/components/schemas/StatusCounts",
+          }),
           ...errorResponses("401", "403", "429", "500", "503"),
         },
       },
@@ -220,10 +242,20 @@ export const openapiDocument: OpenApiDocument = {
             type: "object",
             required: ["claimed", "sent", "retrying", "dead"],
             properties: {
-              claimed: { type: "integer", description: "Rows this cycle took ownership of." },
+              claimed: {
+                type: "integer",
+                description: "Rows this cycle took ownership of.",
+              },
               sent: { type: "integer" },
-              retrying: { type: "integer", description: "Failed, but with attempts left." },
-              dead: { type: "integer", description: "Retries exhausted, or rejected in a way retrying cannot fix." },
+              retrying: {
+                type: "integer",
+                description: "Failed, but with attempts left.",
+              },
+              dead: {
+                type: "integer",
+                description:
+                  "Retries exhausted, or rejected in a way retrying cannot fix.",
+              },
             },
           }),
           ...errorResponses("401", "403", "429", "500", "503"),
@@ -237,10 +269,13 @@ export const openapiDocument: OpenApiDocument = {
         tags: ["Outbox"],
         operationId: "getEmail",
         summary: "Fetch one message",
-        description: "How a caller that got a `202` finds out what happened to it.",
+        description:
+          "How a caller that got a `202` finds out what happened to it.",
         security: [{ bearerAuth: [] }],
         responses: {
-          "200": successResponse("The message.", { $ref: "#/components/schemas/EmailMessage" }),
+          "200": successResponse("The message.", {
+            $ref: "#/components/schemas/EmailMessage",
+          }),
           ...errorResponses("401", "403", "404", "422", "429", "500", "503"),
         },
       },
@@ -256,8 +291,19 @@ export const openapiDocument: OpenApiDocument = {
           "The one transition that runs backwards, and it is operator-driven on purpose. Only `FAILED` and `DEAD` rows may be revived; anything else is a 409.",
         security: [{ bearerAuth: [] }],
         responses: {
-          "202": successResponse("Requeued.", { $ref: "#/components/schemas/EmailMessage" }),
-          ...errorResponses("401", "403", "404", "409", "422", "429", "500", "503"),
+          "202": successResponse("Requeued.", {
+            $ref: "#/components/schemas/EmailMessage",
+          }),
+          ...errorResponses(
+            "401",
+            "403",
+            "404",
+            "409",
+            "422",
+            "429",
+            "500",
+            "503",
+          ),
         },
       },
     },

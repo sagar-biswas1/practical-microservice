@@ -612,7 +612,7 @@ message would hide it while dropping the second email.
 curl -X POST localhost:4004/api/v1/emails \
   -H 'content-type: application/json' \
   -H 'idempotency-key: verify:9f3c…' \
-  -d '{"recipient":"ada@example.com","subject":"Your code","body":"123456","source":"auth.email-verification"}'
+  -d '{"recipient":"delivered@resend.dev","subject":"Your code","body":"123456","source":"auth.email-verification"}'
 ```
 
 `source` is slug-shaped (`auth.email-verification`, `order.confirmed`) rather than free text so

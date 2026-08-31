@@ -38,7 +38,7 @@ enum StockMovementType {
 }
 
 model InventoryItem {
-  id           String   @id @default(cuid()) @db.Uuid
+  id           String   @id @default(uuid()) @db.Uuid
   sku          String   @unique @db.VarChar(64)
   /// Unique: one stock record per product. This is what makes provisioning
   /// safe to retry — a duplicated create is rejected by the database rather
@@ -82,7 +82,7 @@ model InventoryAuditLog {
 }
 
 model StockMovementHistory {
-  id        String            @id @default(cuid()) @db.Uuid
+  id        String            @id @default(uuid()) @db.Uuid
   itemId    String            @map("item_id") @db.Uuid
   item      InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
   type      StockMovementType
