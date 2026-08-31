@@ -38,6 +38,18 @@ const envSchema = z.object({
    * holding connections open until the caller gives up.
    */
   INVENTORY_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000).default(3_000),
+  /**
+   * Serves `/docs` (Swagger UI) and `/openapi.json`.
+   *
+   * On by default: the document is generated from the same Zod schemas the
+   * routes validate with, so "the docs went stale" is not a failure mode worth
+   * defending against. Turn it off where the service surface should not be
+   * enumerable by anyone who can reach the port.
+   */
+  DOCS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
   /** Comma-separated origin list, or `*` for all. */
   CORS_ORIGINS: z.string().default("*"),
   BODY_LIMIT: z.string().default("100kb"),

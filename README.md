@@ -66,6 +66,10 @@ absent: registration answers `emailQueued: false` if the email service is unreac
 verification answers `profileCreated: false` if the user service is. Both are recoverable — by
 a resend and by the next login respectively — so a partial stack is a normal way to work.
 
+Once something is listening, `http://localhost:4000/docs` is the interactive API reference for
+the whole system — the gateway's Swagger UI has a picker covering every service's document. See
+[API](#api).
+
 ## Database layout
 
 Every service points at one PostgreSQL instance but owns a **separate Postgres schema**,
@@ -133,6 +137,10 @@ services/<name>/
 │   │   ├── not-found-handler.ts
 │   │   └── error-handler.ts    # terminal handler: everything → one JSON shape
 │   ├── clients/                # outbound calls to other services (product, auth)
+│   ├── docs/
+│   │   ├── openapi-helpers.ts  # Zod → JSON Schema, response envelopes, shared components
+│   │   ├── openapi.ts          # the OpenAPI 3.1 document
+│   │   └── docs.routes.ts      # serves /openapi.json and Swagger UI at /docs
 │   ├── modules/<domain>/       # schema → repository → service → controller → routes
 │   ├── routes/index.ts         # mounts the API under /api/v1
 │   └── utils/                  # asyncHandler, response envelope helpers
@@ -156,6 +164,7 @@ api-gateway/
 │   │   ├── services.ts         # the routing table: prefix → upstream
 │   │   └── route-policies.ts   # which nested routes need a token, or a role
 │   ├── lib/tokens.ts           # access-token verification (no call to the auth service)
+│   ├── docs/                   # gateway spec + one Swagger UI covering every upstream
 │   ├── proxy/
 │   │   ├── service-proxy.ts    # one reverse proxy per registry entry
 │   │   └── route-policy.ts     # path matcher + chain runner for the policies
@@ -411,6 +420,52 @@ and ask whether it belongs in a layer instead.
   deliberate.
 
 ## API
+
+Every service publishes an OpenAPI 3.1 document and a Swagger UI over it. **Start at the
+gateway** — its docs page carries a definition picker covering all six documents, and the
+gateway forwards paths verbatim, so an endpoint documented under `product` is reachable at that
+same path through the edge:
+
+| Page | URL |
+| --- | --- |
+| Gateway + every upstream (start here) | `http://localhost:4000/docs` |
+| One service on its own | `http://localhost:400<n>/docs` |
+| Raw document | `http://localhost:400<n>/openapi.json` |
+
+The tables below stay as the quick index; the documents are the reference.
+
+### How the documents are built
+
+Request bodies, query strings and path parameters are **derived from the same Zod schemas the
+routers validate with** — `src/docs/openapi.ts` calls `z.toJSONSchema()` on
+`createProductSchema`, `listInventoryQuerySchema` and the rest rather than re-typing them. A
+rule that changes in a `*.schema.ts` therefore cannot go on being documented the old way, and
+"the docs are stale" stops being a failure mode worth defending against.
+
+Conversion runs with `io: "input"`, which is not a detail: several schemas end in a
+`.transform()` — upper-casing a SKU, lower-casing an email — and a transform's *output* has no
+JSON Schema representation at all, so the default throws. The input side is also the only side a
+client can act on, since it is what they have to send.
+
+Response bodies are hand-written in the same file. They are shaped by the service layer and the
+Prisma models, not by a Zod schema, so there is nothing to derive them from — which means a
+response that changes shape needs the document updated by hand.
+
+A few things worth knowing when reading them:
+
+- **The padlocks describe the edge, not the service.** Only the auth service verifies tokens
+  itself. Everywhere else the check happens at the gateway, so an operation marked as requiring
+  `ADMIN` will happily answer an unauthenticated request made directly to its own port — which
+  is exactly why those ports belong on a private network. Each document says so in its
+  description.
+- **`security: []` is deliberate.** An operation carrying it requires no credentials at all,
+  which is a fact worth stating rather than leaving to the absence of a padlock.
+- **The gateway document generates its own tables.** Its routing table and its edge-policy table
+  are rendered from `config/services.ts` and `config/route-policies.ts` at startup, so a service
+  added to the gateway appears in its docs the same day it starts being forwarded.
+
+`DOCS_ENABLED=false` (per service) removes both routes entirely — a 404, not a redirect or a
+login page.
 
 ### Product service (`:4001/api/v1`)
 
@@ -857,7 +912,7 @@ report if anything is missing or malformed — the process fails at boot rather 
 request. See `.env.example` in each service for the full list.
 
 Beyond the shared keys (`PORT`, `DATABASE_URL`, `LOG_LEVEL`, `CORS_ORIGINS`, `BODY_LIMIT`,
-`SHUTDOWN_TIMEOUT_MS`), the product service adds:
+`SHUTDOWN_TIMEOUT_MS`, `DOCS_ENABLED`), the product service adds:
 
 | Variable                | Default                 | Purpose                                        |
 | ----------------------- | ----------------------- | ---------------------------------------------- |
@@ -866,6 +921,10 @@ Beyond the shared keys (`PORT`, `DATABASE_URL`, `LOG_LEVEL`, `CORS_ORIGINS`, `BO
 
 Keep the timeout well under the gateway's `PROXY_TIMEOUT_MS`: a slow inventory service should
 degrade product reads to `stockStatus: UNKNOWN`, not hold connections until the caller gives up.
+
+`DOCS_ENABLED` is on by default in every package, gateway included. Setting it to `false` makes
+`/docs` and `/openapi.json` 404 — worth doing on a deployment whose surface should not be
+enumerable by anyone who can reach the port, and pointless on one that is public anyway.
 
 The **user service** adds nothing — the shared keys are its whole configuration. That is a fair
 summary of the service: it stores profiles and talks to no one.

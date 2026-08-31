@@ -2,6 +2,7 @@ import express, { type Express } from "express";
 import cors from "cors";
 import helmet from "helmet";
 import { corsOrigins, env } from "./config/env.js";
+import { createDocsRouter } from "./docs/docs.routes.js";
 import { errorHandler } from "./middlewares/error-handler.js";
 import { notFoundHandler } from "./middlewares/not-found-handler.js";
 import { requestContext, REQUEST_ID_HEADER } from "./middlewares/request-context.js";
@@ -35,6 +36,12 @@ export function createApp(deps: AppDependencies): Express {
       exposedHeaders: [REQUEST_ID_HEADER],
     }),
   );
+
+  // Docs before anything that can reject a request, so `/docs` stays reachable
+  // regardless of what the API stack in front of the routes decides. The router
+  // matches only `/docs` and `/openapi.json`; everything else falls straight
+  // through.
+  app.use(createDocsRouter());
 
   // Before the body parsers: a malformed-JSON error must still carry a
   // correlation id and show up in the access log.

@@ -3,6 +3,7 @@ import cors from "cors";
 import helmet from "helmet";
 import { corsOrigins, env, trustProxy } from "./config/env.js";
 import { serviceRegistry } from "./config/services.js";
+import { createDocsRouter } from "./docs/docs.routes.js";
 import { bodyLimit } from "./middlewares/body-limit.js";
 import { errorHandler } from "./middlewares/error-handler.js";
 import { notFoundHandler } from "./middlewares/not-found-handler.js";
@@ -44,6 +45,11 @@ export function createApp(deps: AppDependencies = {}): Express {
       exposedHeaders: [REQUEST_ID_HEADER],
     }),
   );
+
+  // Ahead of the rate limiter and the proxies: the docs page is a browser
+  // asset, not API traffic, and throttling it would only make it fail to
+  // render. The router matches `/docs` and `/openapi.json` and nothing else.
+  app.use(createDocsRouter());
 
   // Before anything that can fail: a rejected request must still carry a
   // correlation id and show up in the access log.

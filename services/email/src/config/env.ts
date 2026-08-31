@@ -37,6 +37,18 @@ const envSchema = z
         (value) => value.startsWith("postgres://") || value.startsWith("postgresql://"),
         "DATABASE_URL must be a postgres:// or postgresql:// connection string",
       ),
+    /**
+     * Serves `/docs` (Swagger UI) and `/openapi.json`.
+     *
+     * On by default: the document is generated from the same Zod schemas the
+     * routes validate with, so "the docs went stale" is not a failure mode worth
+     * defending against. Turn it off where the service surface should not be
+     * enumerable by anyone who can reach the port.
+     */
+    DOCS_ENABLED: z
+      .enum(["true", "false"])
+      .default("true")
+      .transform((value) => value === "true"),
     CORS_ORIGINS: z.string().default("*"),
     // Larger than the other services': an HTML email body is the payload here,
     // and 100kb would reject a fairly ordinary templated message.

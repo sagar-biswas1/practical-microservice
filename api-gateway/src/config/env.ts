@@ -102,6 +102,18 @@ const envSchema = z.object({
    */
   TRUST_PROXY: z.string().default("loopback"),
   /** Comma-separated origin list, or `*` for all. */
+  /**
+   * Serves `/docs` (Swagger UI) and `/openapi.json`.
+   *
+   * On by default: the document is generated from the same Zod schemas the
+   * routes validate with, so "the docs went stale" is not a failure mode worth
+   * defending against. Turn it off where the service surface should not be
+   * enumerable by anyone who can reach the port.
+   */
+  DOCS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
   CORS_ORIGINS: z.string().default("*"),
   /**
    * Largest request body the gateway will forward, in bytes. Sized above the
