@@ -153,6 +153,23 @@ export class ProductService {
       );
       return toProductView(product, item);
     } catch (error) {
+      // A failed provisioning call does not mean nothing was written. A
+      // timeout — or a 5xx raised after the far side had already committed —
+      // is an *ambiguous* outcome: the inventory record may exist regardless.
+      // Assuming it does not is what strands a row nothing points at, and
+      // since its SKU is unique over there, that row then blocks the retry
+      // too. So ask inventory rather than infer.
+      //
+      // Inventory is undone first here, the opposite of `remove()`. There the
+      // product is the row a caller can see, so it goes first; here both rows
+      // are going away and the stranded one is the one holding the SKU. If
+      // this step fails the product delete below still runs, leaving exactly
+      // the residue that was left before — never worse.
+      await this.compensate(
+        () => this.discardStock(product.id, context),
+        { productId: product.id },
+        "inventory_rollback_failed",
+      );
       await this.compensate(
         () => this.repository.delete(product.id),
         { productId: product.id },
@@ -278,6 +295,22 @@ export class ProductService {
       logger.warn({ err: error, count: productIds.length }, "inventory_bulk_lookup_failed");
       return { found: new Map(), reachable: false };
     }
+  }
+
+  /**
+   * Undoes a provisioning call whose outcome is unknown.
+   *
+   * The lookup is the whole point: `create` may have committed before the
+   * failure reached us, and inventory is the only thing that can say whether
+   * it did. A record that was never written needs no undoing, so this is safe
+   * to run after every failed create, ambiguous or not.
+   */
+  private async discardStock(productId: string, context?: CallContext): Promise<void> {
+    const item = await this.inventory.findByProductId(productId, context);
+    if (!item) return;
+
+    await this.inventory.delete(item.id, context);
+    logger.warn({ productId, inventoryId: item.id }, "orphaned_inventory_reclaimed");
   }
 
   /**

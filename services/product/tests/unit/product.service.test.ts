@@ -241,6 +241,46 @@ describe("ProductService", () => {
       expect(repository.size).toBe(0);
     });
 
+    it("reclaims the inventory record when provisioning fails ambiguously", async () => {
+      // A timeout: the record was written, but the answer never came back.
+      // The old rollback deleted only the product and stranded this row —
+      // whose SKU then blocked every retry of the same product.
+      inventory.failAfter("create");
+
+      await expect(
+        service.create({
+          sku: "SKU-205",
+          name: "Keyboard",
+          priceCents: 7999,
+          currency: "USD",
+          status: "ACTIVE",
+        }),
+      ).rejects.toMatchObject({ statusCode: 503 });
+
+      expect(repository.size).toBe(0);
+      expect(inventory.size).toBe(0);
+    });
+
+    it("still rolls the product back when the inventory cleanup also fails", async () => {
+      inventory.failAfter("create");
+      inventory.fail("delete");
+
+      await expect(
+        service.create({
+          sku: "SKU-206",
+          name: "Mouse",
+          priceCents: 2999,
+          currency: "USD",
+          status: "ACTIVE",
+        }),
+      ).rejects.toMatchObject({ statusCode: 503 });
+
+      // The undo is best-effort, so the orphan survives — but the product
+      // must not, or a failed create would look like a successful one.
+      expect(repository.size).toBe(0);
+      expect(inventory.size).toBe(1);
+    });
+
     it("forwards the correlation id and actor downstream", async () => {
       await service.create(
         {

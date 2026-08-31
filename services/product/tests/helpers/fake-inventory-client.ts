@@ -25,6 +25,7 @@ type Method =
 export class FakeInventoryClient implements InventoryClient {
   private readonly items = new Map<string, InventoryItem>();
   private readonly failing = new Set<Method>();
+  private readonly failingAfter = new Set<Method>();
 
   readonly calls: Array<{ method: Method; context?: CallContext | undefined }> = [];
 
@@ -56,6 +57,16 @@ export class FakeInventoryClient implements InventoryClient {
     this.failing.add(method);
   }
 
+  /**
+   * Makes `method` apply its effect and *then* reject — the shape of a
+   * timeout, where the far side committed but the caller never learned it.
+   * Only the mutating methods honour this; on the read paths there is no
+   * effect for the distinction to be visible in.
+   */
+  failAfter(method: Method): void {
+    this.failingAfter.add(method);
+  }
+
   get size(): number {
     return this.items.size;
   }
@@ -76,6 +87,7 @@ export class FakeInventoryClient implements InventoryClient {
       reorderLevel: input.reorderLevel ?? 0,
     });
     this.items.set(item.id, this.recompute(item));
+    this.maybeFailAfter("create");
     return this.items.get(item.id) as InventoryItem;
   }
 
@@ -124,11 +136,19 @@ export class FakeInventoryClient implements InventoryClient {
   async delete(id: string, context?: CallContext): Promise<void> {
     this.record("delete", context);
     this.items.delete(id);
+    this.maybeFailAfter("delete");
   }
 
   private record(method: Method, context?: CallContext): void {
     this.calls.push({ method, context });
     if (this.failing.has(method)) {
+      throw new ServiceUnavailableError("Inventory service is unreachable");
+    }
+  }
+
+  /** The `failAfter` half: same error, raised once the write has landed. */
+  private maybeFailAfter(method: Method): void {
+    if (this.failingAfter.has(method)) {
       throw new ServiceUnavailableError("Inventory service is unreachable");
     }
   }
