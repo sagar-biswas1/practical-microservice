@@ -21,15 +21,14 @@ service (to create the profile once an account verifies). Neither call happens i
 database transaction, and neither is allowed to fail the request that triggered it — see
 [services/auth/README.md](services/auth/README.md). The user and email services call nobody.
 
-Clients talk to the gateway, which forwards `/api/v1/products` and `/api/v1/inventory` to the
-service that owns them. See [API gateway](#api-gateway). The services still listen on their own
-ports, so they can be exercised directly in development.
+Clients talk to the gateway, which forwards every `/api/v1/*` path to the service that owns
+it. See [API gateway](#api-gateway). The services still listen on their own ports, so they can
+be exercised directly in development, and the service-to-service calls above go direct rather
+than back out through the edge.
 
-The gateway's routing table does **not** yet carry `user`, `email` or `auth` — those three are
-reached directly on their own ports for now. Adding them is one entry each in
-`api-gateway/src/config/services.ts` plus an upstream URL; the reason it has not happened is
-that authentication at the edge is still an open question, and routing `/api/v1/auth` through a
-gateway that cannot yet verify a token would only move the problem.
+The gateway verifies access tokens itself and enforces a per-route policy in front of each
+upstream — which routes need a token, which need `ADMIN`, which stay public. See
+[Edge policies](#edge-policies).
 
 ## Quick start
 
@@ -44,9 +43,10 @@ cp services/email/.env.example     services/email/.env
 cp services/auth/.env.example      services/auth/.env
 cp api-gateway/.env.example        api-gateway/.env
 
-# The auth service has one variable with no default and refuses to boot without it.
+# The auth service and the gateway both refuse to boot without JWT_SECRET, and it
+# has to be the same value: the gateway verifies the tokens the auth service signs.
 node -e "console.log('JWT_SECRET=' + require('crypto').randomBytes(48).toString('base64url'))" \
-  >> services/auth/.env
+  | tee -a services/auth/.env >> api-gateway/.env
 
 pnpm db:generate     # generate every Prisma client (required before typecheck/build)
 pnpm db:migrate      # create tables — see "Database layout" first
@@ -153,15 +153,20 @@ api-gateway/
 │   ├── app.ts                  # createApp(deps) — middleware stack, no I/O
 │   ├── config/
 │   │   ├── env.ts              # Zod-validated env; process exits on invalid config
-│   │   └── services.ts         # the routing table: prefix → upstream
-│   ├── proxy/service-proxy.ts  # one reverse proxy per registry entry
+│   │   ├── services.ts         # the routing table: prefix → upstream
+│   │   └── route-policies.ts   # which nested routes need a token, or a role
+│   ├── lib/tokens.ts           # access-token verification (no call to the auth service)
+│   ├── proxy/
+│   │   ├── service-proxy.ts    # one reverse proxy per registry entry
+│   │   └── route-policy.ts     # path matcher + chain runner for the policies
 │   ├── middlewares/
-│   │   ├── rate-limit.ts       # per-IP throttle on proxied traffic
+│   │   ├── authenticate.ts     # verifies the token, stamps x-actor-id, checks the role
+│   │   ├── rate-limit.ts       # per-IP throttle, plus the credential-endpoint bucket
 │   │   └── body-limit.ts       # Content-Length guard (bodies are never parsed)
 │   └── modules/health/         # liveness + aggregated upstream readiness
 └── tests/
     ├── unit/
-    ├── integration/            # proxying verified against a real stub upstream
+    ├── integration/            # policies and proxying, against a real stub upstream
     └── helpers/
 ```
 
@@ -630,29 +635,103 @@ proxying, readiness reporting, and the root banner all derive from that one tabl
 
 What it does at the edge, that no individual service should have to:
 
-| Concern           | Behaviour                                                                 |
-| ----------------- | ------------------------------------------------------------------------- |
-| Routing           | `/api/v1/products` → `:4001`, `/api/v1/inventory` → `:4002`, path-for-path |
-| Correlation       | Mints `x-request-id` (honouring an inbound one) and forwards it upstream   |
-| Identity          | Drops any client-supplied `x-actor-id` — see below                         |
-| Rate limiting     | Per-IP, `RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW_MS`, health exempt         |
-| Upstream failures | `503` unreachable, `504` past `PROXY_TIMEOUT_MS`, `502` unusable reply     |
-| Client IP         | `x-forwarded-*` added so upstreams see the real caller                     |
+| Concern           | Behaviour                                                                     |
+| ----------------- | ----------------------------------------------------------------------------- |
+| Routing           | `/auth` → `:4005`, `/users` → `:4003`, `/products` → `:4001`, `/inventory` → `:4002`, `/emails` → `:4004`, path-for-path |
+| Correlation       | Mints `x-request-id` (honouring an inbound one) and forwards it upstream       |
+| Authentication    | Verifies the access token on protected routes; `401` before the upstream is called |
+| Authorisation     | Coarse role check (`ADMIN`) on writes and operational surfaces                 |
+| Identity          | Sets `x-actor-id` from the verified token; drops any client-supplied one       |
+| Rate limiting     | Per-IP, `RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW_MS`, health exempt, plus a tighter shared bucket on the credential endpoints |
+| Upstream failures | `503` unreachable, `504` past `PROXY_TIMEOUT_MS`, `502` unusable reply         |
+| Client IP         | `x-forwarded-*` added so upstreams see the real caller                         |
 
 **The gateway never parses request bodies.** Parsing consumes the request stream the proxy has
 to pipe upstream, so mounting `express.json()` here would leave every proxied `POST` hanging
 with an empty payload. Only the declared `Content-Length` is checked, against `MAX_BODY_BYTES`;
 the service that understands the payload does the precise rejecting.
 
-**`x-actor-id` is stripped, not forwarded.** Downstream audit logs attribute writes to whatever
-arrives in that header, and the gateway is the only hop that talks to untrusted clients — so an
-inbound value is an unverified claim and is dropped. Nothing sets it yet, because there is no
-authentication at this edge; that is where it will be set once there is. `TRUST_CLIENT_ACTOR=true`
-passes the header through for local testing against services that expect an actor.
+**`x-actor-id` is set from the token, never from the client.** Downstream audit logs attribute
+writes to whatever arrives in that header, and the gateway is the only hop that talks to
+untrusted clients — so an inbound value is an unverified claim and is deleted by
+`requestContext` before anything can read it. On a route the edge authenticates, `authenticate`
+then writes it back from the token's `sub`; sending a valid token for yourself alongside an
+`x-actor-id` naming someone else gets you your own id, not theirs. `TRUST_CLIENT_ACTOR=true`
+passes an inbound header through on the *unauthenticated* routes, for local testing against
+services that expect an actor.
 
 **Failures use the same envelope as everything else.** A proxy error surfaces in a raw `http`
 callback rather than in Express, so `buildErrorBody` is shared between the two paths — a `504`
 from a dead upstream looks exactly like a `422` from a Zod schema, correlation id included.
+
+### Edge policies
+
+Not every route behind the gateway should be reachable by everyone, and the interesting cases
+are nested: `POST /api/v1/auth/login` is public while `GET /api/v1/auth/me` is not, and
+`GET /api/v1/products` is public while `DELETE /api/v1/products/:id` is not. So middleware is
+declared per path, in `src/config/route-policies.ts`, one block per upstream:
+
+```ts
+product: [
+  {
+    name: "catalogue-writes",
+    methods: ["POST", "PATCH", "PUT", "DELETE"],
+    paths: ["/", "/:id"],
+    handlers: [authenticate, requireRole(Role.ADMIN)],
+  },
+],
+```
+
+`paths` are relative to the service's prefix. `:name` matches one segment, `/*` matches the
+path and everything below it — `["/", "/:id", "/:id/*"]` is how every inventory stock
+transition is covered without naming `reserve`, `release`, `fulfil` and the rest, so a
+transition added next month is protected the day it ships.
+
+The table is typed as a record over the registry's service names, so **adding an upstream does
+not compile until its policy is declared** — even if the declaration is an empty array. "Which
+routes need a token?" becomes a question you cannot skip.
+
+| Prefix                | Public                                | Authenticated                                         | `ADMIN` only                              |
+| --------------------- | ------------------------------------- | ----------------------------------------------------- | ----------------------------------------- |
+| `/api/v1/auth`        | register, login, refresh, logout, password reset, verification | `/me`, `/sessions`, `/logout-all`, `/change-password`, `/login-history` | — |
+| `/api/v1/users`       | —                                     | `GET`/`PATCH`/`DELETE /:id`                            | `POST /`, `GET /auth/:authUserId`         |
+| `/api/v1/products`    | all reads                             | —                                                     | create, update, delete                    |
+| `/api/v1/inventory`   | —                                     | all reads                                             | writes and every stock transition         |
+| `/api/v1/emails`      | —                                     | —                                                     | the entire surface                        |
+
+`/logout` and `/refresh` stay public deliberately: both authenticate with the refresh token in
+the body, and both are needed exactly when the access token has expired. Requiring one would
+make them useless at the only moment they matter.
+
+**The gateway decides who you are; the service decides what you may do with its data.** The
+edge can prove a token is valid and read a role off it — pure computation on data it already
+holds. It cannot tell whether user `A` owns profile `B` without asking the service that owns
+the answer, and an edge that starts making those calls stops being a router. So there are no
+ownership checks above: identity is forwarded as `x-actor-id` and the service does the rest.
+
+**Verification is local, not a call to the auth service.** The gateway holds the same
+`JWT_SECRET`, `JWT_ISSUER` and `JWT_AUDIENCE`, pins the algorithm to `HS256`, and verifies
+signature/issuer/audience/expiry in microseconds. The cost is that it cannot see a revocation —
+a suspended account still passes until its token expires, a window equal to
+`ACCESS_TOKEN_TTL_MINUTES`. `JWT_SECRET` has no default and the gateway refuses to boot without
+it: an optional secret would give the edge a mode where every policy silently degrades to "let
+everything through", and a control that can be disabled by omission is not a control.
+
+The services still verify the same token themselves. The edge is not a replacement for that —
+it is what stops an unauthenticated request from ever opening a connection to an upstream, and
+what makes a `401` look identical whichever service would have served it.
+
+**Credential endpoints get a second, tighter budget.** Login, registration, refresh, password
+reset and verification share one bucket of `AUTH_RATE_LIMIT_MAX` per `AUTH_RATE_LIMIT_WINDOW_MS`
+(20 per 15 minutes by default) on top of the general limit. One bucket across all of them, so
+rotating between `/login` and `/forgot-password` does not buy a fresh allowance.
+
+**Why the policies match paths by hand.** The obvious spelling — `router.use("/auth/me", h)` —
+does not work here. Express strips a mount prefix from `req.url`, and the proxy forwards
+`req.url` unchanged, so mounting anything at a path would rewrite the request out from under
+the proxy and send `/api/v1/auth/me` upstream as `/`. Every handler is therefore mounted at the
+root and tests the full path itself (`src/proxy/route-policy.ts`), which keeps `req.url`
+untouched and the matching small enough to unit test.
 
 ### Gateway health
 
@@ -850,17 +929,29 @@ anyone who knows an email address a way to lock its owner out on demand.
 The gateway has no `DATABASE_URL` or `BODY_LIMIT` — it is stateless and parses no bodies — and
 adds:
 
-| Variable                | Default                 | Purpose                                              |
-| ----------------------- | ----------------------- | ---------------------------------------------------- |
-| `PRODUCT_SERVICE_URL`   | `http://localhost:4001` | Upstream base URL                                    |
-| `INVENTORY_SERVICE_URL` | `http://localhost:4002` | Upstream base URL                                    |
-| `PROXY_TIMEOUT_MS`      | `15000`                 | Upstream response budget before `504`                |
-| `HEALTH_TIMEOUT_MS`     | `2000`                  | Budget for one readiness probe                       |
-| `RATE_LIMIT_WINDOW_MS`  | `60000`                 | Throttle window                                      |
-| `RATE_LIMIT_MAX`        | `300`                   | Requests per window, per IP, per replica             |
-| `MAX_BODY_BYTES`        | `1048576`               | Largest `Content-Length` forwarded                   |
-| `TRUST_CLIENT_ACTOR`    | `false`                 | Forward a client-supplied `x-actor-id` (testing only) |
-| `TRUST_PROXY`           | `loopback`              | Whether `x-forwarded-for` is believed                |
+| Variable                    | Default                 | Purpose                                               |
+| --------------------------- | ----------------------- | ----------------------------------------------------- |
+| `PRODUCT_SERVICE_URL`       | `http://localhost:4001` | Upstream base URL                                     |
+| `INVENTORY_SERVICE_URL`     | `http://localhost:4002` | Upstream base URL                                     |
+| `USER_SERVICE_URL`          | `http://localhost:4003` | Upstream base URL                                     |
+| `EMAIL_SERVICE_URL`         | `http://localhost:4004` | Upstream base URL                                     |
+| `AUTH_SERVICE_URL`          | `http://localhost:4005` | Upstream base URL                                     |
+| `JWT_SECRET`                | *(none — required)*     | Must match the auth service byte for byte             |
+| `JWT_ISSUER`                | `auth-service`          | Must match the auth service                           |
+| `JWT_AUDIENCE`              | `practical-microservice`| Must match the auth service                           |
+| `PROXY_TIMEOUT_MS`          | `15000`                 | Upstream response budget before `504`                 |
+| `HEALTH_TIMEOUT_MS`         | `2000`                  | Budget for one readiness probe                        |
+| `RATE_LIMIT_WINDOW_MS`      | `60000`                 | Throttle window                                       |
+| `RATE_LIMIT_MAX`            | `300`                   | Requests per window, per IP, per replica              |
+| `AUTH_RATE_LIMIT_WINDOW_MS` | `900000`                | Window for the shared credential-endpoint bucket      |
+| `AUTH_RATE_LIMIT_MAX`       | `20`                    | Credential requests per window, per IP, per replica   |
+| `MAX_BODY_BYTES`            | `1048576`               | Largest `Content-Length` forwarded                    |
+| `TRUST_CLIENT_ACTOR`        | `false`                 | Forward a client-supplied `x-actor-id` on unauthenticated routes (testing only) |
+| `TRUST_PROXY`               | `loopback`              | Whether `x-forwarded-for` is believed                 |
+
+`JWT_SECRET` has no default here either, for the same reason it has none in the auth service —
+and it must be the *same* value. A mismatch does not fail loudly: every token simply looks
+forged, and the whole system answers `401`.
 
 `TRUST_PROXY` decides what `req.ip` resolves to, and `req.ip` is the rate limiter's key. It
 defaults to `loopback` rather than `true` because trusting every hop lets any client forge

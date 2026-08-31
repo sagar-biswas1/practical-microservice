@@ -26,3 +26,43 @@ export const rateLimiter: RequestHandler = rateLimit({
     next(new TooManyRequestsError("Too many requests, please retry later"));
   },
 });
+
+export interface StrictRateLimitOptions {
+  /** Appears in the 429 message so a caller knows which budget it hit. */
+  name: string;
+  windowMs: number;
+  limit: number;
+  /**
+   * Overridable so a test can exercise the limiter itself. Everything else
+   * skips under `NODE_ENV=test`, for the reason given above.
+   */
+  skip?: () => boolean;
+}
+
+/**
+ * A second, tighter throttle for a named set of routes.
+ *
+ * Each call builds its own store, so one instance is one bucket: share an
+ * instance across the routes that should draw on a common allowance, and
+ * create a separate one where the budgets are meant to be independent.
+ *
+ * The general limiter still applies — these compose rather than replace, and a
+ * request counted here was already counted there.
+ */
+export function createStrictRateLimiter({
+  name,
+  windowMs,
+  limit,
+  skip = () => isTest,
+}: StrictRateLimitOptions): RequestHandler {
+  return rateLimit({
+    windowMs,
+    limit,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    skip,
+    handler: (_req, _res, next) => {
+      next(new TooManyRequestsError(`Too many ${name} requests, please retry later`));
+    },
+  });
+}
