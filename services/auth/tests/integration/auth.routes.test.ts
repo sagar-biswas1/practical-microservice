@@ -17,7 +17,7 @@ const PASSWORD = "correct-horse-battery-staple";
 const BASE = "/api/v1/auth";
 
 const registration = {
-  email: "ada@example.com",
+  email: "delivered@resend.dev",
   username: "ada",
   password: PASSWORD,
   profile: {
@@ -74,7 +74,10 @@ describe("auth routes", () => {
 
       expect(response.body).toMatchObject({
         success: true,
-        data: { emailQueued: true, user: { email: "ada@example.com", verified: false } },
+        data: {
+          emailQueued: true,
+          user: { email: "delivered@resend.dev", verified: false },
+        },
       });
       // The response is serialised JSON — if the hash were on the entity, this
       // is where it would show up.
@@ -126,11 +129,18 @@ describe("auth routes", () => {
     it("normalises the email and username to lower case", async () => {
       await request(app)
         .post(`${BASE}/register`)
-        .send({ ...registration, email: "ADA@Example.COM", username: "AdA" })
+        .send({
+          ...registration,
+          email: "delivered@resend.dev",
+          username: "AdA",
+        })
         .expect(201);
 
-      // Otherwise `ADA@example.com` and `ada@example.com` are two accounts.
-      await request(app).post(`${BASE}/register`).send(registration).expect(409);
+      // Otherwise `delivered@resend.dev` and `delivered@resend.dev` are two accounts.
+      await request(app)
+        .post(`${BASE}/register`)
+        .send(registration)
+        .expect(409);
     });
   });
 
@@ -451,7 +461,7 @@ describe("auth routes", () => {
       const response = await request(app)
         .post(`${BASE}/login`)
         .set("content-type", "application/json")
-        .send('{"email": "ada@example.com",}')
+        .send('{"email": "delivered@resend.dev",}')
         .expect(400);
 
       expect(response.body.error.code).toBe("BAD_REQUEST");

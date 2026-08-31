@@ -6,7 +6,7 @@ import type { OutboundEmail } from "../../src/providers/email-provider.js";
 const message: OutboundEmail = {
   id: "8f1c6e2a-1111-4111-8111-111111111111",
   from: "noreply@example.com",
-  to: "ada@example.com",
+  to: "delivered@resend.dev",
   subject: "Welcome",
   body: "Hello there",
   bodyType: "TEXT",
@@ -56,7 +56,10 @@ describe("ResendProvider", () => {
     await provider.send(message);
     await provider.send({ ...message, bodyType: "HTML", body: "<b>Hi</b>" });
 
-    expect(payloads[0]).toMatchObject({ to: ["ada@example.com"], text: "Hello there" });
+    expect(payloads[0]).toMatchObject({
+      to: ["delivered@resend.dev"],
+      text: "Hello there",
+    });
     expect(payloads[0]).not.toHaveProperty("html");
     expect(payloads[1]).toMatchObject({ html: "<b>Hi</b>" });
     expect(payloads[1]).not.toHaveProperty("text");

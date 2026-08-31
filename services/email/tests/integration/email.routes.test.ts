@@ -12,7 +12,7 @@ const BASE = `${API_PREFIX}/emails`;
 const UNKNOWN_ID = "1c9e6679-7425-40de-944b-e07fc1f90ae7";
 
 const validPayload = {
-  recipient: "Ada@Example.com",
+  recipient: "delivered@resend.dev",
   subject: "Welcome aboard",
   body: "Hello there",
   source: "user-service",
@@ -63,7 +63,7 @@ describe("emails API", () => {
         success: true,
         data: {
           // Normalised, as the user service does with its email column.
-          recipient: "ada@example.com",
+          recipient: "delivered@resend.dev",
           source: "user-service",
           // 202 rather than 201: the row is committed, the email is not sent.
           status: "PENDING",

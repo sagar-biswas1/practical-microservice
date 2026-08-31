@@ -6,7 +6,7 @@ import { InMemoryEmailRepository } from "../helpers/in-memory-email-repository.j
 import { expectOk } from "../helpers/result.js";
 
 const validInput: SendEmailInput = {
-  recipient: "ada@example.com",
+  recipient: "delivered@resend.dev",
   subject: "Welcome",
   body: "Hello there",
   bodyType: "TEXT",
@@ -33,7 +33,7 @@ describe("EmailService", () => {
       const result = expectOk(await service.enqueue(validInput));
       expect(result.replayed).toBe(false);
       expect(result.message).toMatchObject({
-        recipient: "ada@example.com",
+        recipient: "delivered@resend.dev",
         source: "user-service",
         status: "PENDING",
         attempts: 0,

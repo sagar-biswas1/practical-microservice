@@ -12,7 +12,7 @@ const UNKNOWN_ID = "1c9e6679-7425-40de-944b-e07fc1f90ae7";
 const validPayload = {
   authUserId: "auth|abc123",
   name: "Ada Lovelace",
-  email: "Ada@Example.com",
+  email: "delivered@resend.dev",
   address: "12 Analytical Engine Way",
   phone: "+1 555 000 1111",
 };
@@ -38,7 +38,7 @@ describe("users API", () => {
 
       expect(response.body).toMatchObject({
         success: true,
-        data: { authUserId: "auth|abc123", email: "ada@example.com" },
+        data: { authUserId: "auth|abc123", email: "delivered@resend.dev" },
       });
       expect(response.body.data.id).toBeTruthy();
       expect(repository.size).toBe(1);
@@ -84,7 +84,11 @@ describe("users API", () => {
 
       const response = await request(app)
         .post(BASE)
-        .send({ ...validPayload, authUserId: "auth|other", email: "ADA@example.com" })
+        .send({
+          ...validPayload,
+          authUserId: "auth|other",
+          email: "delivered@resend.dev",
+        })
         .expect(409);
 
       expect(response.body.error.message).toMatch(/email/);

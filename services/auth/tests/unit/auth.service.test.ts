@@ -14,7 +14,7 @@ import { StubEmailClient, StubUserClient } from "../helpers/stub-clients.js";
 const PASSWORD = "correct-horse-battery-staple";
 
 const registration: RegisterInput = {
-  email: "ada@example.com",
+  email: "delivered@resend.dev",
   username: "ada",
   password: PASSWORD,
   profile: {
@@ -66,7 +66,12 @@ describe("AuthService", () => {
       expect(error).toBeNull();
       expect(result).toMatchObject({
         emailQueued: true,
-        user: { email: "ada@example.com", username: "ada", verified: false, userId: null },
+        user: {
+          email: "delivered@resend.dev",
+          username: "ada",
+          verified: false,
+          userId: null,
+        },
       });
       expect(emailClient.sent).toHaveLength(1);
       expect(emailClient.lastSource()).toBe("auth.email-verification");
@@ -148,7 +153,7 @@ describe("AuthService", () => {
         name: "Ada Lovelace",
         address: "12 Analytical Engine Way",
         phone: "+15550001111",
-        email: "ada@example.com",
+        email: "delivered@resend.dev",
       });
     });
 
