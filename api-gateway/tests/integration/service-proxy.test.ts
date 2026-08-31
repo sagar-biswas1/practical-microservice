@@ -23,7 +23,9 @@ function routeTo(target: string): ServiceRoute {
 }
 
 function appProxyingTo(target: string): Express {
-  return createApp({ proxies: [createServiceProxy(routeTo(target))] });
+  // The raw proxy, with no edge policies in front of it: these tests are about
+  // the hop itself. Policy behaviour is covered in route-policies.test.ts.
+  return createApp({ upstreamHandlers: [createServiceProxy(routeTo(target))] });
 }
 
 describe("service proxy", () => {

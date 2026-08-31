@@ -28,6 +28,9 @@ importers:
       http-proxy-middleware:
         specifier: ^3.0.7
         version: 3.0.7
+      jose:
+        specifier: ^6.2.7
+        version: 6.2.7
       morgan:
         specifier: ^1.10.1
         version: 1.11.0

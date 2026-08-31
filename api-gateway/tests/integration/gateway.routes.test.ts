@@ -6,9 +6,9 @@ import { API_PREFIX } from "../../src/routes/index.js";
 import type { DependencyReport } from "../../src/modules/health/health.routes.js";
 
 function buildApp(checkReadiness?: () => Promise<DependencyReport>): Express {
-  // No proxies: these tests cover the gateway's own surface, so an empty list
-  // keeps every unmatched path falling through to the 404 handler.
-  return createApp({ proxies: [], ...(checkReadiness ? { checkReadiness } : {}) });
+  // No upstream handlers: these tests cover the gateway's own surface, so an
+  // empty list keeps every unmatched path falling through to the 404 handler.
+  return createApp({ upstreamHandlers: [], ...(checkReadiness ? { checkReadiness } : {}) });
 }
 
 describe("gateway surface", () => {
@@ -21,8 +21,11 @@ describe("gateway surface", () => {
         data: { service: "api-gateway-test", apiPrefix: API_PREFIX },
       });
       expect(response.body.data.upstreams).toEqual([
+        { name: "auth", prefix: `${API_PREFIX}/auth` },
+        { name: "user", prefix: `${API_PREFIX}/users` },
         { name: "product", prefix: `${API_PREFIX}/products` },
         { name: "inventory", prefix: `${API_PREFIX}/inventory` },
+        { name: "email", prefix: `${API_PREFIX}/emails` },
       ]);
     });
   });

@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Edge gateway: single entry point in front of the product and inventory services",
+  "description": "Edge gateway: single entry point in front of the auth, user, product, inventory, and email services",
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
@@ -21,6 +21,7 @@
     "express-rate-limit": "^8.6.1",
     "helmet": "^8.1.0",
     "http-proxy-middleware": "^3.0.7",
+    "jose": "^6.2.7",
     "morgan": "^1.10.1",
     "pino": "^9.7.0",
     "zod": "^4.0.14"

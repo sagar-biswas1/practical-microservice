@@ -9,15 +9,16 @@ import { notFoundHandler } from "./middlewares/not-found-handler.js";
 import { rateLimiter } from "./middlewares/rate-limit.js";
 import { requestContext, REQUEST_ID_HEADER } from "./middlewares/request-context.js";
 import { requestLogger } from "./middlewares/request-logger.js";
-import { createServiceProxies } from "./proxy/service-proxy.js";
+import { createServiceHandlers } from "./proxy/service-proxy.js";
 import { API_PREFIX, createApiRouter, type RouterDependencies } from "./routes/index.js";
 
 export interface AppDependencies extends RouterDependencies {
   /**
-   * Upstream proxies, in match order. Injected so tests can stand in fake
-   * handlers instead of running the product and inventory services.
+   * Edge policies and upstream proxies, flattened into one chain in match
+   * order. Injected so tests can stand in fake handlers instead of running the
+   * five upstream services.
    */
-  proxies?: RequestHandler[];
+  upstreamHandlers?: RequestHandler[];
 }
 
 /**
@@ -74,10 +75,12 @@ export function createApp(deps: AppDependencies = {}): Express {
   app.use(rateLimiter);
 
   // Mounted without a path: Express strips a mount prefix from `req.url`, and
-  // the proxies forward `req.url` as-is. Each one filters on the full path
-  // internally and calls `next()` when it does not own the route.
-  for (const proxy of deps.proxies ?? createServiceProxies()) {
-    app.use(proxy);
+  // the proxies forward `req.url` as-is. Each handler — policy or proxy —
+  // filters on the full path internally and calls `next()` when it does not
+  // own the route. Within a service, its policies run before its proxy, so a
+  // rejected request never opens a connection to the upstream.
+  for (const handler of deps.upstreamHandlers ?? createServiceHandlers()) {
+    app.use(handler);
   }
 
   // Order matters: 404 first, then the terminal error handler.

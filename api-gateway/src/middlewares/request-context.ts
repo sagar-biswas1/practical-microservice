@@ -40,9 +40,10 @@ export const requestContext: RequestHandler = (req, res, next) => {
     req.actor = claimed.slice(0, ACTOR_MAX_LENGTH);
     req.headers[ACTOR_HEADER] = req.actor;
   } else {
-    // No authentication at this edge yet, so any client-supplied actor is an
-    // unverified claim. Dropping it keeps forged identities out of downstream
-    // audit logs; an authenticated actor gets set here once auth lands.
+    // A client-supplied actor is an unverified claim, so it is dropped before
+    // anything downstream can read it. On a route the edge authenticates,
+    // `authenticate` writes the header back from the token's subject — which
+    // works precisely because this ran first and left nothing behind.
     delete req.headers[ACTOR_HEADER];
   }
 

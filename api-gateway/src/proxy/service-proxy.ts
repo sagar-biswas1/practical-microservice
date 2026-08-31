@@ -2,8 +2,10 @@ import type { Socket } from "node:net";
 import type { Request, RequestHandler, Response } from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import { env } from "../config/env.js";
+import { routePolicies } from "../config/route-policies.js";
 import type { ServiceRoute } from "../config/services.js";
 import { serviceRegistry } from "../config/services.js";
+import { createPolicyHandlers } from "./route-policy.js";
 import { logger } from "../lib/logger.js";
 import {
   AppError,
@@ -135,4 +137,23 @@ export function createServiceProxy(route: ServiceRoute): RequestHandler {
 /** One proxy per registry entry, in declaration order. */
 export function createServiceProxies(): RequestHandler[] {
   return serviceRegistry.map(createServiceProxy);
+}
+
+/**
+ * The full upstream chain: each service's edge policies followed by its proxy,
+ * concatenated in registry order.
+ *
+ * Flat rather than nested because every handler is mounted at the root — see
+ * `route-policy.ts` for why nothing here can carry a mount path. A policy that
+ * does not cover a request calls `next()`, and since the prefixes are disjoint
+ * a request only ever reaches the policies of the service that owns it.
+ *
+ * The proxy is last within each group and terminal: once it matches, nothing
+ * declared after it runs.
+ */
+export function createServiceHandlers(): RequestHandler[] {
+  return serviceRegistry.flatMap((route) => [
+    ...createPolicyHandlers(route, routePolicies[route.name]),
+    createServiceProxy(route),
+  ]);
 }

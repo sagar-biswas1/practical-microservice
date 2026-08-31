@@ -32,6 +32,23 @@ const envSchema = z.object({
   /** Upstreams. The gateway is stateless — it owns no database. */
   PRODUCT_SERVICE_URL: upstreamUrl("http://localhost:4001"),
   INVENTORY_SERVICE_URL: upstreamUrl("http://localhost:4002"),
+  USER_SERVICE_URL: upstreamUrl("http://localhost:4003"),
+  EMAIL_SERVICE_URL: upstreamUrl("http://localhost:4004"),
+  AUTH_SERVICE_URL: upstreamUrl("http://localhost:4005"),
+
+  /**
+   * Verification key for the access tokens the auth service mints. It must be
+   * byte-identical to that service's `JWT_SECRET`, and the issuer/audience
+   * must match too — otherwise every token the gateway sees looks forged.
+   *
+   * Required rather than optional on purpose. An optional secret gives the
+   * gateway a mode where the edge policies silently degrade to "let everything
+   * through", and a security control that can be disabled by omission is not a
+   * control. Verification is pure computation — no call to the auth service.
+   */
+  JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
+  JWT_ISSUER: z.string().min(1).default("auth-service"),
+  JWT_AUDIENCE: z.string().min(1).default("practical-microservice"),
 
   /**
    * How long an upstream has to respond before the gateway gives up and
@@ -47,10 +64,26 @@ const envSchema = z.object({
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(300),
 
   /**
+   * A second, much tighter budget applied only to the credential endpoints —
+   * login, registration, password reset, token refresh. Those are the routes
+   * where a request is worth guessing at scale, and the general ceiling of 300
+   * per minute is far too generous to slow an online password attack down.
+   *
+   * One bucket covers all of them together, so rotating between `/login` and
+   * `/forgot-password` does not buy an attacker a fresh allowance.
+   */
+  AUTH_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(900_000),
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
+
+  /**
    * When false (the default), an inbound `x-actor-id` is discarded before
    * proxying so a client cannot forge the identity that downstream audit logs
-   * attribute writes to. Enable it only for local testing against services
-   * that expect an actor, until real authentication lands at this edge.
+   * attribute writes to.
+   *
+   * On a route the edge authenticates, the header is set from the verified
+   * token regardless of this flag — a proven identity always wins over a
+   * claimed one. This only decides what happens on the unauthenticated routes,
+   * and the honest answer there is "nothing you say about who you are".
    */
   TRUST_CLIENT_ACTOR: z
     .enum(["true", "false"])
