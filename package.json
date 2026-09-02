@@ -17,6 +17,10 @@
     "db:generate": "pnpm -r db:generate",
     "db:migrate": "pnpm -r db:migrate",
     "db:push": "pnpm -r db:push",
+    "redis:up": "docker compose up -d redis",
+    "redis:down": "docker compose down",
+    "redis:logs": "docker compose logs -f redis",
+    "redis:cli": "docker compose exec redis redis-cli",
     "clean": "pnpm -r exec rm -rf dist node_modules/.cache && rm -rf node_modules"
   }
 }

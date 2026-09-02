@@ -1,0 +1,33 @@
+# Shared local infrastructure. Application services still run on the host via
+# `pnpm dev` — this file only provides the backing stores they talk to.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: practical-microservice-redis
+    restart: unless-stopped
+    ports:
+      # Host port matches the default REDIS_PORT / REDIS_URL in the services'
+      # .env files, so nothing needs configuring after `docker compose up`.
+      - "6379:6379"
+    command:
+      # AOF plus a periodic snapshot: cart state (carts, stream backlogs) then
+      # survives a container restart instead of coming back empty.
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--save"
+      - "60"
+      - "1"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      # `depends_on: condition: service_healthy` hangs off this once a service
+      # moves into compose.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  redis-data:
