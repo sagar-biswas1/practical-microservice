@@ -34,6 +34,25 @@ const envSchema = z.object({
   SERVICE_NAME: z.string().min(1).default('cart-service'),
 
   /**
+   * The inventory service, called directly rather than through the gateway.
+   * The gateway's stock-mutation policy is admin-only and exists to keep
+   * end users off these endpoints; this is service-to-service traffic on the
+   * internal network, the same way the product service reaches inventory.
+   */
+  INVENTORY_SERVICE_URL: z.url().default('http://localhost:4002'),
+  /**
+   * A cart creation blocks on this call, so the budget is a shopper's
+   * patience, not a batch job's. Inventory answers from a single indexed
+   * transaction; anything beyond this is a stall, not slowness.
+   */
+  INVENTORY_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(30_000)
+    .default(5_000),
+
+  /**
    * Full connection string. When set it wins over the discrete REDIS_* fields
    * below, which then only serve as documentation of the same values.
    * `rediss://` selects TLS without needing REDIS_TLS.
@@ -67,6 +86,91 @@ const envSchema = z.object({
     .positive()
     .max(60_000)
     .default(2_000),
+  /**
+   * Whether to issue `CONFIG SET notify-keyspace-events` at startup.
+   *
+   * Turn it off where the command is denied — managed Redis usually forbids
+   * it — and set the flags on the server instead. The release path degrades
+   * to the sweeper rather than breaking, so this is a latency knob, not a
+   * correctness one.
+   */
+  REDIS_CONFIGURE_NOTIFICATIONS: booleanFlag.default(true),
+
+  /**
+   * How long a cart survives without being touched. The window slides: every
+   * read or write of the session pushes it out again.
+   *
+   * This is also how long inventory holds the units, so it trades a shopper's
+   * convenience against stock sitting unsellable in an abandoned cart.
+   */
+  CART_TTL_SECONDS: z.coerce.number().int().positive().max(86_400).default(60),
+  /**
+   * How much longer the items hash outlives its session key.
+   *
+   * The expiry of the session is what triggers the release, and the hash is
+   * the only record of what to hand back — so it has to still be there when
+   * the event arrives. The grace window is the budget for that handover,
+   * including a retry or two while inventory is unreachable.
+   */
+  CART_TTL_GRACE_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(86_400)
+    .default(300),
+  /**
+   * Lifetime of the per-cart write lock. It has to comfortably exceed the
+   * worst-case run of a single update — a reserve, a release and a
+   * compensating call, each bounded by INVENTORY_TIMEOUT_MS — or the lock
+   * lapses mid-flight and a second writer starts from stale quantities.
+   */
+  CART_LOCK_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(120_000)
+    .default(15_000),
+  /** Attempts to take the write lock before giving up with a 409. */
+  CART_LOCK_RETRIES: z.coerce.number().int().nonnegative().max(200).default(25),
+  CART_LOCK_RETRY_DELAY_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(1_000)
+    .default(40),
+  /**
+   * How long one replica owns a cart's release. Every replica sees the same
+   * expiry event, so this is what stops all of them releasing the same units.
+   */
+  CART_RELEASE_LOCK_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(300)
+    .default(30),
+  /** Whether to release reservations when a cart expires. */
+  CART_RELEASE_ON_EXPIRY: booleanFlag.default(true),
+  /**
+   * How often the sweeper looks for carts whose expiry event never arrived.
+   * Keyspace notifications are fire-and-forget: Redis does not redeliver one
+   * that landed while this service was restarting, so without the sweep those
+   * units stay reserved forever.
+   */
+  CART_SWEEP_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(600_000)
+    .default(15_000),
+  /** Carts examined per sweep, so one pass cannot monopolise the loop. */
+  CART_SWEEP_BATCH: z.coerce.number().int().positive().max(1_000).default(100),
+  /** Backoff before a release that failed on a transport error is retried. */
+  CART_RELEASE_RETRY_DELAY_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(600_000)
+    .default(30_000),
 });
 
 export type Env = z.infer<typeof envSchema>;

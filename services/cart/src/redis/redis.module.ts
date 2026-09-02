@@ -3,6 +3,7 @@ import type { Redis } from 'ioredis';
 
 import { createRedisClient } from './redis.config';
 import { REDIS_CLIENT, REDIS_EVENT_CLIENT } from './redis.constants';
+import { RedisLock } from './redis.lock';
 import { RedisService } from './redis.service';
 
 async function connect(role: 'default' | 'events'): Promise<Redis> {
@@ -30,7 +31,7 @@ const eventClientProvider: Provider = {
  */
 @Global()
 @Module({
-  providers: [clientProvider, eventClientProvider, RedisService],
-  exports: [REDIS_CLIENT, REDIS_EVENT_CLIENT, RedisService],
+  providers: [clientProvider, eventClientProvider, RedisService, RedisLock],
+  exports: [REDIS_CLIENT, REDIS_EVENT_CLIENT, RedisService, RedisLock],
 })
 export class RedisModule {}

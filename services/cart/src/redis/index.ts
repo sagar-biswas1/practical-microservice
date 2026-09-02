@@ -1,5 +1,6 @@
 export { RedisModule } from './redis.module';
 export { RedisService } from './redis.service';
+export { RedisLock, type Lock, type AcquireOptions } from './redis.lock';
 export {
   InjectRedis,
   InjectRedisEvents,

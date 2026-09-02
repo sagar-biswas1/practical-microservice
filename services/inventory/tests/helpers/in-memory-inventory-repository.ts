@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type {
+  BulkStockChangePlanner,
   InventoryAuditLog,
   InventoryItem,
   InventoryRepository,
@@ -190,6 +191,53 @@ export class InMemoryInventoryRepository implements InventoryRepository {
       next.movement.reason ?? null,
       next.movement.reference ?? null,
     );
+
+    return updated;
+  }
+
+  /**
+   * Mirrors the real all-or-nothing sequence: read every addressed row, let
+   * the planner reject the batch as a whole, and only then write. Nothing is
+   * mutated before the planner returns, so a throw leaves the store untouched
+   * exactly as the aborted transaction would.
+   */
+  async applyBulkStockChange(
+    productIds: string[],
+    plan: BulkStockChangePlanner,
+  ): Promise<InventoryItem[]> {
+    const wanted = new Set(productIds);
+    const byProductId = new Map(
+      [...this.items.values()]
+        .filter((item) => wanted.has(item.productId))
+        .map((item) => [item.productId, item] as const),
+    );
+
+    const plans = plan(byProductId);
+
+    const updated: InventoryItem[] = [];
+    for (const next of plans) {
+      const current = byProductId.get(next.productId);
+      if (!current) {
+        throw new NotFoundError(`No inventory item exists for product '${next.productId}'`);
+      }
+
+      const item: InventoryItem = {
+        ...current,
+        quantity: next.quantity,
+        reserved: next.reserved,
+        updatedAt: new Date(),
+      };
+      this.items.set(item.id, item);
+      this.recordMovement(
+        item.id,
+        next.movement.type,
+        next.movement.quantity,
+        current.quantity,
+        next.movement.reason ?? null,
+        next.movement.reference ?? null,
+      );
+      updated.push(item);
+    }
 
     return updated;
   }

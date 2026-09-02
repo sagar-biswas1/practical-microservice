@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { INestApplication } from '@nestjs/common';
 import { AppModule } from './app.module';
@@ -35,6 +35,19 @@ async function bootstrap() {
   // Required for RedisService.onApplicationShutdown to run, so connections
   // close instead of being cut off with the process.
   app.enableShutdownHooks();
+
+  // Without this the DTOs' decorators are inert: `quantity` arrives as
+  // whatever JSON held, and the cart's delta arithmetic is only sound for
+  // whole numbers. `transform` is what turns the plain body into CartItemDto
+  // instances in the first place, and `forbidNonWhitelisted` rejects stray
+  // fields rather than silently dropping them.
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    }),
+  );
 
   // `nest start --watch` SIGTERMs the old process and spawns its replacement
   // immediately; the old one has to be gone, not merely closing.

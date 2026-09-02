@@ -4,6 +4,8 @@ import { sendCreated, sendNoContent, sendPaginated, sendSuccess } from "../../ut
 import type { InventoryService } from "./inventory.service.js";
 import type {
   AdjustStockInput,
+  BulkReleaseStockInput,
+  BulkReserveStockInput,
   CreateInventoryItemInput,
   FulfilStockInput,
   InventoryIdParams,
@@ -89,6 +91,26 @@ export class InventoryController {
     const item = await this.service.release(params.id, body);
     req.log.info({ itemId: item.id, quantity: body.quantity }, "stock_released");
     sendSuccess(res, item);
+  };
+
+  reserveMany = async (req: Request, res: Response): Promise<void> => {
+    const { body } = validated<BulkReserveStockInput>(req);
+    const items = await this.service.reserveMany(body);
+    req.log.info(
+      { lines: body.items.length, reference: body.reference },
+      "stock_bulk_reserved",
+    );
+    sendSuccess(res, items);
+  };
+
+  releaseMany = async (req: Request, res: Response): Promise<void> => {
+    const { body } = validated<BulkReleaseStockInput>(req);
+    const items = await this.service.releaseMany(body);
+    req.log.info(
+      { lines: body.items.length, reference: body.reference },
+      "stock_bulk_released",
+    );
+    sendSuccess(res, items);
   };
 
   fulfil = async (req: Request, res: Response): Promise<void> => {

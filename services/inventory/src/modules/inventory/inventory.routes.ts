@@ -4,6 +4,8 @@ import { asyncHandler } from "../../utils/async-handler.js";
 import type { InventoryController } from "./inventory.controller.js";
 import {
   adjustStockSchema,
+  bulkReleaseStockSchema,
+  bulkReserveStockSchema,
   createInventoryItemSchema,
   fulfilStockSchema,
   inventoryIdParamsSchema,
@@ -27,6 +29,20 @@ export function createInventoryRouter(controller: InventoryController): Router {
 
   // Registered before `/:id` so the literal segment is not shadowed.
   router.get("/sku/:sku", validate({ params: skuParamsSchema }), asyncHandler(controller.getBySku));
+
+  // Also before `/:id`, and before the `/:id/...` transitions below: without
+  // this ordering `/bulk/reserve` matches `/:id/reserve` with an id of "bulk"
+  // and is rejected as a malformed UUID.
+  router.post(
+    "/bulk/reserve",
+    validate({ body: bulkReserveStockSchema }),
+    asyncHandler(controller.reserveMany),
+  );
+  router.post(
+    "/bulk/release",
+    validate({ body: bulkReleaseStockSchema }),
+    asyncHandler(controller.releaseMany),
+  );
 
   router.get("/:id", validate({ params: inventoryIdParamsSchema }), asyncHandler(controller.getById));
   router.patch(
