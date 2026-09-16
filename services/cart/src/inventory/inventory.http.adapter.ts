@@ -8,6 +8,11 @@ import type { AxiosInstance, AxiosResponse } from 'axios';
 
 import { InsufficientStockException } from './insufficient-stock.exception';
 import { InjectInventoryHttp } from './inventory.constants';
+import type {
+  InventoryDispatch,
+  InventoryPort,
+  StockChangeOptions,
+} from './inventory.port';
 import {
   MAX_BULK_LINES,
   type CallContext,
@@ -34,7 +39,12 @@ interface Envelope<T> {
 }
 
 /**
- * The cart's window onto the inventory service.
+ * Inventory over HTTP: the adapter behind both ports.
+ *
+ * Registered under `INVENTORY_PORT` always, and under `INVENTORY_DISPATCH`
+ * while that side is configured for HTTP. When the dispatch side moves to
+ * RabbitMQ only the second registration changes — this class keeps serving
+ * the reservations and lookups a caller has to wait on.
  *
  * Calls go direct rather than through the api-gateway: the gateway's
  * stock-mutation policy is admin-only and exists to keep end users off these
@@ -42,8 +52,8 @@ interface Envelope<T> {
  * internal network, the same route the product service takes.
  */
 @Injectable()
-export class InventoryClient {
-  private readonly logger = new Logger(InventoryClient.name);
+export class HttpInventoryAdapter implements InventoryPort, InventoryDispatch {
+  private readonly logger = new Logger(HttpInventoryAdapter.name);
 
   constructor(
     /** Configured and supplied by `InventoryModule`; see `INVENTORY_HTTP`. */
@@ -63,7 +73,7 @@ export class InventoryClient {
   reserveMany(
     items: StockLine[],
     reference: string,
-    options: { reason?: string; context?: CallContext } = {},
+    options: StockChangeOptions = {},
   ): Promise<InventoryItem[]> {
     return this.bulk('reserve', items, reference, options);
   }
@@ -78,12 +88,72 @@ export class InventoryClient {
    * driving this from a cleanup path should treat that as "already released"
    * and check the per-line `code` rather than retrying blindly.
    */
-  releaseMany(
+  async releaseMany(
     items: StockLine[],
     reference: string,
-    options: { reason?: string; context?: CallContext } = {},
-  ): Promise<InventoryItem[]> {
-    return this.bulk('release', items, reference, options);
+    options: StockChangeOptions = {},
+  ): Promise<void> {
+    // Returns nothing, because the AMQP adapter beside this one cannot know
+    // the resulting stock levels. A caller that needs them is on the wrong
+    // port.
+    await this.bulk('release', items, reference, options);
+  }
+
+  /**
+   * Moves a hold from one reference to another.
+   *
+   * Two calls, in this order out of necessity: reserving under the new
+   * reference first would need the stock to be available twice over, which
+   * for the shopper who is holding it is exactly the case that fails.
+   *
+   * The cost is a window — measured in the round trip between the two calls —
+   * in which the units are unheld and another shopper can take them. Losing
+   * that race surfaces as `InsufficientStockException` after the hold has been
+   * put back under `from`, so the caller is told and nothing is stranded.
+   *
+   * Inventory tracks `reserved` as a single counter and records the reference
+   * only on the ledger row, so the window closes properly only when inventory
+   * grows an atomic `POST /inventory/bulk/transfer`. At that point this method
+   * becomes one call and no caller changes.
+   */
+  async transferHold(
+    items: StockLine[],
+    from: string,
+    to: string,
+    options: StockChangeOptions = {},
+  ): Promise<void> {
+    if (items.length === 0) return;
+
+    await this.bulk('release', items, from, {
+      ...options,
+      reason: options.reason ?? 'Hold transferred out',
+    });
+
+    try {
+      await this.bulk('reserve', items, to, {
+        ...options,
+        reason: options.reason ?? 'Hold transferred in',
+      });
+    } catch (error) {
+      // Put the hold back where it was. If this fails too the units are
+      // simply unheld: the cart still lists them, so its expiry will try to
+      // release them, get a conflict, and retire — no stock is stranded.
+      try {
+        await this.bulk('reserve', items, from, {
+          ...options,
+          reason: 'Rolling back a failed hold transfer',
+        });
+      } catch (rollbackError: unknown) {
+        const message =
+          rollbackError instanceof Error
+            ? rollbackError.message
+            : String(rollbackError);
+        this.logger.error(
+          `could not restore the hold for ${from} after a failed transfer to ${to}: ${message}`,
+        );
+      }
+      throw error;
+    }
   }
 
   /** Stock for one product, or null when it has not been provisioned yet. */
@@ -137,7 +207,7 @@ export class InventoryClient {
     transition: 'reserve' | 'release',
     items: StockLine[],
     reference: string,
-    options: { reason?: string; context?: CallContext },
+    options: StockChangeOptions,
   ): Promise<InventoryItem[]> {
     if (items.length === 0) return [];
 

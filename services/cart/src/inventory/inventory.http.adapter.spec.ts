@@ -6,9 +6,11 @@ import { Test } from '@nestjs/testing';
 import type { AxiosInstance, AxiosResponse } from 'axios';
 
 import { InsufficientStockException } from './insufficient-stock.exception';
-import { InventoryClient } from './inventory.client';
+import { HttpInventoryAdapter } from './inventory.http.adapter';
 import { INVENTORY_HTTP } from './inventory.constants';
 import { InventoryModule } from './inventory.module';
+import { AmqpInventoryDispatch } from './inventory.amqp.adapter';
+import { INVENTORY_DISPATCH, INVENTORY_PORT } from './inventory.port';
 import type { InventoryItem, StockLine } from './inventory.types';
 
 type RequestConfig = { method: string; url: string; data?: unknown };
@@ -49,7 +51,7 @@ const LINES: StockLine[] = [
   { productId: 'b4f0e9d2-3a71-4c58-9f1e-2d6c8a5b7e34', quantity: 1 },
 ];
 
-describe('InventoryClient', () => {
+describe('HttpInventoryAdapter', () => {
   describe('module wiring', () => {
     // Every other test builds the client with `new`, which is exactly how a
     // constructor Nest cannot satisfy still passed a green suite. This one
@@ -59,7 +61,40 @@ describe('InventoryClient', () => {
         imports: [InventoryModule],
       }).compile();
 
-      expect(module.get(InventoryClient)).toBeInstanceOf(InventoryClient);
+      expect(module.get(HttpInventoryAdapter)).toBeInstanceOf(
+        HttpInventoryAdapter,
+      );
+      await module.close();
+    });
+
+    it('serves both ports from one instance while dispatch is HTTP', async () => {
+      const module = await Test.createTestingModule({
+        imports: [InventoryModule],
+      }).compile();
+
+      const adapter = module.get(HttpInventoryAdapter);
+
+      // Same object behind both tokens: a release shares the connection pool
+      // and the error translation with everything else until the transport
+      // moves.
+      expect(module.get(INVENTORY_PORT)).toBe(adapter);
+      expect(module.get(INVENTORY_DISPATCH)).toBe(adapter);
+      await module.close();
+    });
+
+    it('keeps the AMQP dispatch out of the way until it is selected', async () => {
+      const module = await Test.createTestingModule({
+        imports: [InventoryModule],
+      }).compile();
+
+      // Constructed, so a wiring mistake surfaces at boot rather than on the
+      // first expiry after the transport is flipped — but not wired in.
+      expect(module.get(AmqpInventoryDispatch)).toBeInstanceOf(
+        AmqpInventoryDispatch,
+      );
+      expect(module.get(INVENTORY_DISPATCH)).not.toBeInstanceOf(
+        AmqpInventoryDispatch,
+      );
       await module.close();
     });
 
@@ -76,7 +111,7 @@ describe('InventoryClient', () => {
         .useValue(http)
         .compile();
 
-      await module.get(InventoryClient).reserveMany(LINES, 'cart_1');
+      await module.get(HttpInventoryAdapter).reserveMany(LINES, 'cart_1');
 
       expect(calls[0]?.url).toBe('/api/v1/inventory/bulk/reserve');
       await module.close();
@@ -90,7 +125,7 @@ describe('InventoryClient', () => {
         data: { success: true, data: [buildItem()] },
       }));
 
-      await new InventoryClient(http).reserveMany(LINES, 'cart_1');
+      await new HttpInventoryAdapter(http).reserveMany(LINES, 'cart_1');
 
       expect(calls).toHaveLength(1);
       expect(calls[0]).toMatchObject({
@@ -106,7 +141,7 @@ describe('InventoryClient', () => {
         data: { success: true, data: [] },
       }));
 
-      await new InventoryClient(http).releaseMany(LINES, 'cart_1', {
+      await new HttpInventoryAdapter(http).releaseMany(LINES, 'cart_1', {
         reason: 'Cart cancelled',
       });
 
@@ -126,7 +161,7 @@ describe('InventoryClient', () => {
         },
       } as unknown as AxiosInstance;
 
-      await new InventoryClient(http).reserveMany(LINES, 'cart_1', {
+      await new HttpInventoryAdapter(http).reserveMany(LINES, 'cart_1', {
         context: { requestId: 'trace-1', actor: 'user-42' },
       });
 
@@ -143,7 +178,7 @@ describe('InventoryClient', () => {
       }));
 
       await expect(
-        new InventoryClient(http).reserveMany([], 'cart_1'),
+        new HttpInventoryAdapter(http).reserveMany([], 'cart_1'),
       ).resolves.toEqual([]);
       expect(calls).toHaveLength(0);
     });
@@ -159,9 +194,94 @@ describe('InventoryClient', () => {
       ];
 
       await expect(
-        new InventoryClient(http).reserveMany(duplicated, 'cart_1'),
+        new HttpInventoryAdapter(http).reserveMany(duplicated, 'cart_1'),
       ).rejects.toThrow(BadRequestException);
       expect(calls).toHaveLength(0);
+    });
+  });
+
+  describe('transferHold', () => {
+    it('releases the old reference before reserving the new one', async () => {
+      const { http, calls } = stubHttp(() => ({
+        status: 200,
+        data: { success: true, data: [] },
+      }));
+
+      await new HttpInventoryAdapter(http).transferHold(
+        LINES,
+        'cart_1',
+        'order_9',
+      );
+
+      // Forced order: reserving first would need the stock to be available
+      // twice over, which for the shopper already holding it always fails.
+      expect(calls.map((call) => call.url)).toEqual([
+        '/api/v1/inventory/bulk/release',
+        '/api/v1/inventory/bulk/reserve',
+      ]);
+      expect(calls[0]?.data).toMatchObject({ reference: 'cart_1' });
+      expect(calls[1]?.data).toMatchObject({ reference: 'order_9' });
+    });
+
+    it('puts the hold back under the old reference when the new one is refused', async () => {
+      const { http, calls } = stubHttp((config) => {
+        const body = config.data as { reference: string };
+        if (body.reference === 'order_9') {
+          return {
+            status: 409,
+            data: {
+              success: false,
+              data: null,
+              error: { message: 'taken', details: [] },
+            },
+          };
+        }
+        return { status: 200, data: { success: true, data: [] } };
+      });
+
+      await expect(
+        new HttpInventoryAdapter(http).transferHold(LINES, 'cart_1', 'order_9'),
+      ).rejects.toBeInstanceOf(InsufficientStockException);
+
+      expect(
+        calls.map((call) => [
+          call.url,
+          (call.data as { reference: string }).reference,
+        ]),
+      ).toEqual([
+        ['/api/v1/inventory/bulk/release', 'cart_1'],
+        ['/api/v1/inventory/bulk/reserve', 'order_9'],
+        ['/api/v1/inventory/bulk/reserve', 'cart_1'],
+      ]);
+    });
+
+    it('costs nothing for an empty cart', async () => {
+      const { http, calls } = stubHttp(() => ({
+        status: 200,
+        data: { success: true, data: [] },
+      }));
+
+      await new HttpInventoryAdapter(http).transferHold(
+        [],
+        'cart_1',
+        'order_9',
+      );
+
+      expect(calls).toHaveLength(0);
+    });
+  });
+
+  describe('AmqpInventoryDispatch', () => {
+    it('refuses to pretend it published, so a release is never silently lost', async () => {
+      await expect(
+        new AmqpInventoryDispatch().releaseMany(LINES, 'cart_1'),
+      ).rejects.toThrow('not implemented');
+    });
+
+    it('is a no-op for an empty batch, like the HTTP adapter', async () => {
+      await expect(
+        new AmqpInventoryDispatch().releaseMany([], 'cart_1'),
+      ).resolves.toBeUndefined();
     });
   });
 
@@ -189,7 +309,7 @@ describe('InventoryClient', () => {
         },
       }));
 
-      const error = await new InventoryClient(http)
+      const error = await new HttpInventoryAdapter(http)
         .reserveMany(LINES, 'cart_1')
         .catch((caught: unknown) => caught);
 
@@ -218,7 +338,7 @@ describe('InventoryClient', () => {
         },
       }));
 
-      const error = await new InventoryClient(http)
+      const error = await new HttpInventoryAdapter(http)
         .reserveMany(LINES, 'cart_1')
         .catch((caught: unknown) => caught);
 
@@ -232,7 +352,7 @@ describe('InventoryClient', () => {
       }));
 
       await expect(
-        new InventoryClient(http).reserveMany(LINES, 'cart_1'),
+        new HttpInventoryAdapter(http).reserveMany(LINES, 'cart_1'),
       ).rejects.toThrow(ServiceUnavailableException);
     });
 
@@ -242,7 +362,7 @@ describe('InventoryClient', () => {
       } as unknown as AxiosInstance;
 
       await expect(
-        new InventoryClient(http).reserveMany(LINES, 'cart_1'),
+        new HttpInventoryAdapter(http).reserveMany(LINES, 'cart_1'),
       ).rejects.toThrow(ServiceUnavailableException);
     });
 
@@ -253,7 +373,7 @@ describe('InventoryClient', () => {
       }));
 
       await expect(
-        new InventoryClient(http).reserveMany(LINES, 'cart_1'),
+        new HttpInventoryAdapter(http).reserveMany(LINES, 'cart_1'),
       ).rejects.toThrow(BadRequestException);
     });
   });
@@ -266,7 +386,7 @@ describe('InventoryClient', () => {
         data: { success: true, data: [item] },
       }));
 
-      const found = await new InventoryClient(http).findByProductIds([
+      const found = await new HttpInventoryAdapter(http).findByProductIds([
         item.productId,
       ]);
 
@@ -281,7 +401,7 @@ describe('InventoryClient', () => {
       }));
 
       await expect(
-        new InventoryClient(http).findByProductIds([]),
+        new HttpInventoryAdapter(http).findByProductIds([]),
       ).resolves.toEqual(new Map());
       expect(calls).toHaveLength(0);
     });

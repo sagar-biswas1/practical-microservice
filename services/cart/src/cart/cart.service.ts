@@ -1,5 +1,7 @@
 import {
   BadRequestException,
+  ConflictException,
+  Inject,
   Injectable,
   Logger,
   ServiceUnavailableException,
@@ -8,10 +10,13 @@ import { randomUUID } from 'node:crypto';
 
 import { env } from '../config/env';
 import {
+  INVENTORY_DISPATCH,
+  INVENTORY_PORT,
   InsufficientStockException,
-  InventoryClient,
   MAX_BULK_LINES,
   type CallContext,
+  type InventoryDispatch,
+  type InventoryPort,
   type StockLine,
 } from '../inventory';
 import { RedisLock } from '../redis/redis.lock';
@@ -22,11 +27,16 @@ import {
   planChanges,
 } from './cart.planner';
 import { CartRepository } from './cart.repository';
-import { CART_ROLLBACK_REASON, CART_UPDATE_REASON } from './cart.constants';
+import {
+  CART_CHECKOUT_REASON,
+  CART_ROLLBACK_REASON,
+  CART_UPDATE_REASON,
+} from './cart.constants';
 import {
   isNoop,
   type CartChanges,
   type CartLine,
+  type CheckoutResult,
   type ReleaseCause,
   type ReleaseOutcome,
   type ResolvedSession,
@@ -46,7 +56,15 @@ export class CartService {
 
   constructor(
     private readonly carts: CartRepository,
-    private readonly inventoryClient: InventoryClient,
+    /** Calls a shopper is waiting on. Always request/response. */
+    @Inject(INVENTORY_PORT) private readonly inventory: InventoryPort,
+    /**
+     * Calls nobody waits on. Whether these travel over HTTP or a broker is
+     * `INVENTORY_DISPATCH_TRANSPORT`'s business, not this class's — which is
+     * why a release is reached through a different reference than a
+     * reservation despite both ending up at the same service today.
+     */
+    @Inject(INVENTORY_DISPATCH) private readonly dispatch: InventoryDispatch,
     private readonly locks: RedisLock,
     private readonly keys: CartKeys,
   ) {}
@@ -92,9 +110,9 @@ export class CartService {
     const settled = await this.locks.withLock(
       this.keys.writeLock(cartSessionId),
       {
-        ttlMs: env.CART_LOCK_TTL_MS as number,
-        retries: env.CART_LOCK_RETRIES as number,
-        retryDelayMs: env.CART_LOCK_RETRY_DELAY_MS as number,
+        ttlMs: env.CART_LOCK_TTL_MS,
+        retries: env.CART_LOCK_RETRIES,
+        retryDelayMs: env.CART_LOCK_RETRY_DELAY_MS,
       },
       () => this.applyRequested(requested, cartSessionId, context),
     );
@@ -135,12 +153,81 @@ export class CartService {
   }
 
   /**
+   * Hands the cart's hold over to an order and ends the cart.
+   *
+   * This exists because reading a cart and then deleting it is not the same
+   * as taking it. Between those two calls the session can expire, and the
+   * release that fires wins: the order service writes a row believing five
+   * units are held while the expiry hands those same five back. The sweeper
+   * makes that certain rather than unlikely — an event missed at the wrong
+   * moment is retried until it lands.
+   *
+   * Under the write lock, none of that can interleave — which is why
+   * `releaseSession` takes that same lock and not merely its own. A concurrent
+   * expiry waits, and by the time it runs the cart is gone, so it finds
+   * nothing to release and says so. The hold moves reference instead of being
+   * dropped and retaken, so there is no moment when the order's units are
+   * unowned and no second release for anyone to double.
+   */
+  async checkout(
+    cartSessionId: string,
+    orderId: string,
+    context: CallContext,
+  ): Promise<CheckoutResult> {
+    const settled = await this.locks.withLock(
+      this.keys.writeLock(cartSessionId),
+      {
+        ttlMs: env.CART_LOCK_TTL_MS,
+        retries: env.CART_LOCK_RETRIES,
+        retryDelayMs: env.CART_LOCK_RETRY_DELAY_MS,
+      },
+      async () => {
+        const lines = await this.carts.lines(cartSessionId);
+        if (lines.length === 0) {
+          throw new ConflictException('This cart is empty');
+        }
+
+        await this.inventory.transferHold(lines, cartSessionId, orderId, {
+          reason: CART_CHECKOUT_REASON,
+          context,
+        });
+
+        // Only now, and atomically: the cart stops existing in the same step
+        // that stops anything being able to release it.
+        await this.carts.discard(cartSessionId);
+
+        this.logger.log(
+          `cart ${cartSessionId} checked out as order ${orderId} (${lines.length} line(s))`,
+        );
+
+        return { cartSessionId, orderId, lines };
+      },
+    );
+
+    if (settled === null) {
+      throw new ServiceUnavailableException(
+        'Another update to this cart is still in progress; try again',
+      );
+    }
+
+    return settled;
+  }
+
+  /**
    * Hands a cart's units back to inventory.
    *
    * Driven by the expiry event, by the sweeper, and by an explicit abandon —
    * and safe to call from all three at once, which is exactly what happens,
    * since every replica subscribed to keyspace events sees the same
-   * notification. The lock is what turns that into one release.
+   * notification.
+   *
+   * Two locks, because they answer different questions. The release lock stops
+   * replicas racing each other to hand back the same units. The write lock
+   * stops this racing an *update*: a cart's TTL can lapse while a checkout or
+   * a line change is mid-flight, and without it this would read the lines that
+   * request is in the middle of moving and release them out from under it.
+   * Giving up on either is reported as `locked`, and the cart stays on the
+   * sweeper's queue to be tried again.
    *
    * A 409 from inventory is terminal rather than retried: it means the units
    * are not held, which is where a release was trying to get to anyway.
@@ -153,16 +240,28 @@ export class CartService {
     const outcome = await this.locks.withLock(
       this.keys.releaseLock(cartSessionId),
       { ttlMs: env.CART_RELEASE_LOCK_SECONDS * 1_000 },
-      async () => {
-        const held = await this.carts.takeHeldLines(cartSessionId);
+      () =>
+        // Both locks, and this is the only path that takes both — which is
+        // what makes the nesting deadlock-free, since nothing acquires them
+        // the other way round.
+        this.locks.withLock(
+          this.keys.writeLock(cartSessionId),
+          {
+            ttlMs: env.CART_LOCK_TTL_MS,
+            retries: env.CART_LOCK_RETRIES,
+            retryDelayMs: env.CART_LOCK_RETRY_DELAY_MS,
+          },
+          async () => {
+            const held = await this.carts.takeHeldLines(cartSessionId);
 
-        if (held.length === 0) {
-          await this.carts.forget(cartSessionId);
-          return { released: false, skipped: 'empty', lines: 0 } as const;
-        }
+            if (held.length === 0) {
+              await this.carts.forget(cartSessionId);
+              return { released: false, skipped: 'empty', lines: 0 } as const;
+            }
 
-        return this.releaseHeld(cartSessionId, held, cause);
-      },
+            return this.releaseHeld(cartSessionId, held, cause);
+          },
+        ),
     );
 
     return outcome ?? { released: false, skipped: 'locked', lines: 0 };
@@ -206,7 +305,7 @@ export class CartService {
 
     try {
       if (changes.reserve.length > 0) {
-        await this.inventoryClient.reserveMany(changes.reserve, cartSessionId, {
+        await this.inventory.reserveMany(changes.reserve, cartSessionId, {
           reason: CART_UPDATE_REASON,
           context,
         });
@@ -214,7 +313,7 @@ export class CartService {
       }
 
       if (changes.release.length > 0) {
-        await this.inventoryClient.releaseMany(changes.release, cartSessionId, {
+        await this.dispatch.releaseMany(changes.release, cartSessionId, {
           reason: CART_UPDATE_REASON,
           context,
         });
@@ -252,13 +351,13 @@ export class CartService {
 
     try {
       if (reserved.length > 0) {
-        await this.inventoryClient.releaseMany(reserved, cartSessionId, {
+        await this.dispatch.releaseMany(reserved, cartSessionId, {
           reason: CART_ROLLBACK_REASON,
           context,
         });
       }
       if (released.length > 0) {
-        await this.inventoryClient.reserveMany(released, cartSessionId, {
+        await this.inventory.reserveMany(released, cartSessionId, {
           reason: CART_ROLLBACK_REASON,
           context,
         });
@@ -292,7 +391,7 @@ export class CartService {
     };
 
     try {
-      await this.inventoryClient.releaseMany(held, cartSessionId, {
+      await this.dispatch.releaseMany(held, cartSessionId, {
         reason: `Cart ${cause}`,
         context,
       });
@@ -312,7 +411,7 @@ export class CartService {
       // next sweep tries again.
       await this.carts.scheduleRelease(
         cartSessionId,
-        (Date.now() + env.CART_RELEASE_RETRY_DELAY_MS) as number,
+        Date.now() + env.CART_RELEASE_RETRY_DELAY_MS,
       );
       throw error;
     }

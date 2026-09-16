@@ -115,6 +115,22 @@ export class CartRepository {
     );
   }
 
+  /**
+   * Ends a cart outright, contents and session together.
+   *
+   * Used when the hold has moved elsewhere — a checkout — where `retire` is
+   * not enough: leaving the session key alive would let its expiry wake a
+   * release for units the cart no longer owns.
+   */
+  async discard(cartSessionId: string): Promise<void> {
+    await this.redis.cartDiscard(
+      this.keys.items(cartSessionId),
+      this.keys.session(cartSessionId),
+      this.keys.dueIndex,
+      cartSessionId,
+    );
+  }
+
   /** Takes a cart off the sweeper's queue without touching its contents. */
   async forget(cartSessionId: string): Promise<void> {
     await this.redis.zrem(this.keys.dueIndex, cartSessionId);

@@ -59,3 +59,11 @@ export interface ResolvedSession {
   cartSessionId: string;
   created: boolean;
 }
+
+/** What a checkout hands to the order service. */
+export interface CheckoutResult {
+  cartSessionId: string;
+  orderId: string;
+  /** The lines now held under `orderId` rather than under the cart. */
+  lines: CartLine[];
+}

@@ -1,10 +1,15 @@
 import {
   BadRequestException,
+  ConflictException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 
-import { InsufficientStockException, InventoryClient } from '../inventory';
+import {
+  INVENTORY_DISPATCH,
+  INVENTORY_PORT,
+  InsufficientStockException,
+} from '../inventory';
 import { RedisLock } from '../redis/redis.lock';
 import { CartKeys } from './cart.keys';
 import { CartRepository } from './cart.repository';
@@ -27,11 +32,18 @@ describe('CartService', () => {
       | 'retire'
       | 'forget'
       | 'scheduleRelease'
+      | 'discard'
     >
   >;
-  let inventory: { reserveMany: jest.Mock; releaseMany: jest.Mock };
+  let inventory: {
+    reserveMany: jest.Mock;
+    transferHold: jest.Mock;
+    releaseMany: jest.Mock;
+  };
   /** Whether the lock is available; the mock runs the work when it is. */
   let lockAvailable: boolean;
+  /** Every lock key taken, in order, so nesting can be asserted on. */
+  let lockedKeys: string[];
 
   const cart = (lines: Record<string, number>): CartLine[] =>
     Object.entries(lines).map(([productId, quantity]) => ({
@@ -52,19 +64,25 @@ describe('CartService', () => {
       retire: jest.fn().mockResolvedValue(undefined),
       forget: jest.fn().mockResolvedValue(undefined),
       scheduleRelease: jest.fn().mockResolvedValue(undefined),
+      discard: jest.fn().mockResolvedValue(undefined),
     };
 
+    // One object behind both tokens, exactly as the HTTP transport wires it.
     inventory = {
       reserveMany: jest.fn().mockResolvedValue([]),
-      releaseMany: jest.fn().mockResolvedValue([]),
+      transferHold: jest.fn().mockResolvedValue(undefined),
+      releaseMany: jest.fn().mockResolvedValue(undefined),
     };
 
+    lockedKeys = [];
     const locks = {
       // `withLock` returns null when the lock is taken — the same signal the
       // real one gives, so the service's handling of it is under test too.
       withLock: jest.fn(
-        async (_key: string, _opts: unknown, work: () => Promise<unknown>) =>
-          lockAvailable ? await work() : null,
+        async (key: string, _opts: unknown, work: () => Promise<unknown>) => {
+          lockedKeys.push(key);
+          return lockAvailable ? await work() : null;
+        },
       ),
     };
 
@@ -73,7 +91,8 @@ describe('CartService', () => {
         CartService,
         CartKeys,
         { provide: CartRepository, useValue: carts },
-        { provide: InventoryClient, useValue: inventory },
+        { provide: INVENTORY_PORT, useValue: inventory },
+        { provide: INVENTORY_DISPATCH, useValue: inventory },
         { provide: RedisLock, useValue: locks },
       ],
     }).compile();
@@ -271,6 +290,81 @@ describe('CartService', () => {
     });
   });
 
+  describe('checkout', () => {
+    it('moves the hold to the order and ends the cart', async () => {
+      carts.lines.mockResolvedValue(cart({ p1: 2, p2: 1 }));
+
+      const result = await service.checkout(SESSION, 'order-9', {});
+
+      expect(inventory.transferHold).toHaveBeenCalledWith(
+        cart({ p1: 2, p2: 1 }),
+        SESSION,
+        'order-9',
+        expect.objectContaining({ reason: 'Cart checked out' }),
+      );
+      expect(result).toEqual({
+        cartSessionId: SESSION,
+        orderId: 'order-9',
+        lines: cart({ p1: 2, p2: 1 }),
+      });
+    });
+
+    it('never releases and re-reserves, which is what would double up', async () => {
+      carts.lines.mockResolvedValue(cart({ p1: 2 }));
+
+      await service.checkout(SESSION, 'order-9', {});
+
+      expect(inventory.releaseMany).not.toHaveBeenCalled();
+      expect(inventory.reserveMany).not.toHaveBeenCalled();
+    });
+
+    it("discards the cart so no expiry can release the order's units", async () => {
+      carts.lines.mockResolvedValue(cart({ p1: 2 }));
+
+      await service.checkout(SESSION, 'order-9', {});
+
+      // discard drops the session key too; retire would leave it alive to
+      // expire and wake a release for units the order now owns.
+      expect(carts.discard).toHaveBeenCalledWith(SESSION);
+      expect(carts.retire).not.toHaveBeenCalled();
+    });
+
+    it('leaves the cart intact when the transfer fails', async () => {
+      carts.lines.mockResolvedValue(cart({ p1: 2 }));
+      inventory.transferHold.mockRejectedValue(
+        new InsufficientStockException('taken', [
+          { productId: 'p1', code: 'CONFLICT', message: 'taken' },
+        ]),
+      );
+
+      await expect(
+        service.checkout(SESSION, 'order-9', {}),
+      ).rejects.toBeInstanceOf(InsufficientStockException);
+
+      expect(carts.discard).not.toHaveBeenCalled();
+    });
+
+    it('refuses to check out an empty cart', async () => {
+      carts.lines.mockResolvedValue([]);
+
+      await expect(
+        service.checkout(SESSION, 'order-9', {}),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(inventory.transferHold).not.toHaveBeenCalled();
+    });
+
+    it('waits behind a concurrent write rather than reading stale lines', async () => {
+      lockAvailable = false;
+
+      await expect(
+        service.checkout(SESSION, 'order-9', {}),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+
+      expect(inventory.transferHold).not.toHaveBeenCalled();
+    });
+  });
+
   describe('releaseSession', () => {
     it('hands every held line back and retires the cart', async () => {
       carts.takeHeldLines.mockResolvedValue(cart({ p1: 2, p2: 3 }));
@@ -348,6 +442,51 @@ describe('CartService', () => {
         SESSION,
         expect.any(Number),
       );
+      expect(carts.retire).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('lock discipline', () => {
+    const keys = new CartKeys();
+
+    it('serialises a release against an update, not just against other releases', async () => {
+      // Regression: the release path once took only its own lock, so an
+      // expiry firing mid-checkout read the lines that checkout was in the
+      // middle of moving and released them out from under the order.
+      carts.takeHeldLines.mockResolvedValue(cart({ p1: 1 }));
+
+      await service.releaseSession(SESSION, 'expired');
+
+      expect(lockedKeys).toEqual([
+        keys.releaseLock(SESSION),
+        keys.writeLock(SESSION),
+      ]);
+    });
+
+    it('takes the release lock outermost, so the nesting cannot deadlock', async () => {
+      carts.takeHeldLines.mockResolvedValue(cart({ p1: 1 }));
+      await service.releaseSession(SESSION, 'expired');
+      const releasePath = [...lockedKeys];
+
+      lockedKeys = [];
+      carts.lines.mockResolvedValue(cart({ p1: 1 }));
+      await service.checkout(SESSION, 'order-9', {});
+
+      // Nothing else takes both, and the one path that does always takes them
+      // in this order — which is what makes the nesting safe.
+      expect(releasePath[0]).toBe(keys.releaseLock(SESSION));
+      expect(lockedKeys).toEqual([keys.writeLock(SESSION)]);
+    });
+
+    it('reports a contended write lock as locked, leaving the sweeper to retry', async () => {
+      lockAvailable = false;
+
+      await expect(service.releaseSession(SESSION, 'swept')).resolves.toEqual({
+        released: false,
+        skipped: 'locked',
+        lines: 0,
+      });
+      expect(carts.forget).not.toHaveBeenCalled();
       expect(carts.retire).not.toHaveBeenCalled();
     });
   });

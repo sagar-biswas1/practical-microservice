@@ -113,6 +113,22 @@ return redis.call('ZREM', KEYS[2], ARGV[1])
 `;
 
 /**
+ * Ends a cart outright: contents, session and queue entry in one step.
+ *
+ * KEYS: items hash, session sentinel, due index. ARGV: sessionId.
+ *
+ * Atomic because the order the three keys go in decides a race. Dropping the
+ * session first would publish an expiry event while the items are still
+ * there, and the handler that woke on it would release units that have just
+ * been handed to an order. One step, no ordering to get wrong.
+ */
+const CART_DISCARD = `
+redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[2])
+return redis.call('ZREM', KEYS[3], ARGV[1])
+`;
+
+/**
  * The client with the cart scripts attached.
  *
  * `defineCommand` adds methods at runtime that TypeScript cannot see, so this
@@ -146,6 +162,13 @@ export type CartRedis = Redis & {
     dueKey: string,
     cartSessionId: string,
   ): Promise<number>;
+
+  cartDiscard(
+    itemsKey: string,
+    sessionKey: string,
+    dueKey: string,
+    cartSessionId: string,
+  ): Promise<number>;
 };
 
 /**
@@ -157,6 +180,7 @@ export function registerCartScripts(redis: Redis): CartRedis {
   redis.defineCommand('cartTouch', { numberOfKeys: 3, lua: CART_TOUCH });
   redis.defineCommand('cartTake', { numberOfKeys: 1, lua: CART_TAKE });
   redis.defineCommand('cartFinish', { numberOfKeys: 2, lua: CART_FINISH });
+  redis.defineCommand('cartDiscard', { numberOfKeys: 3, lua: CART_DISCARD });
 
   return redis as CartRedis;
 }

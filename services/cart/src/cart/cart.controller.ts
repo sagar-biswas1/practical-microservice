@@ -16,8 +16,9 @@ import { CART_SESSION_HEADER } from './cart.constants';
 import { CartService } from './cart.service';
 import { CartSessionId } from './decorators/cart-session.decorator';
 import { RequestContext } from './decorators/request-context.decorator';
+import { CheckoutCartDto } from './dto/checkout-cart.dto';
 import { SetCartItemsDto } from './dto/set-cart-items.dto';
-import type { CartLine } from './cart.types';
+import type { CartLine, CheckoutResult } from './cart.types';
 
 /**
  * The cart's HTTP surface.
@@ -67,6 +68,28 @@ export class CartController {
     res.setHeader(CART_SESSION_HEADER, cartSessionId);
 
     return this.cartService.lines(cartSessionId);
+  }
+
+  /**
+   * Hands the cart's hold to an order and ends the cart.
+   *
+   * Called by the order service, not by a browser: it names an order that
+   * must already exist, so that the reference on inventory's ledger points at
+   * something real. The gateway should keep this off public routes for the
+   * same reason it does the stock-mutation endpoints.
+   *
+   * 409 for an empty cart — there is nothing to check out, and a caller that
+   * asked has got its state wrong. 404 for a session that has already gone.
+   */
+  @Post('checkout')
+  @HttpCode(HttpStatus.OK)
+  async checkout(
+    @Body() dto: CheckoutCartDto,
+    @CartSessionId() claimed: string | null,
+    @RequestContext() context: CallContext,
+  ): Promise<CheckoutResult> {
+    const cartSessionId = await this.requireSession(claimed);
+    return this.cartService.checkout(cartSessionId, dto.orderId, context);
   }
 
   /**

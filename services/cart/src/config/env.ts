@@ -53,6 +53,23 @@ const envSchema = z.object({
     .default(5_000),
 
   /**
+   * How the fire-and-forget half of the inventory contract travels.
+   *
+   * Only that half is switchable, and deliberately so: reservations and the
+   * checkout transfer have a caller waiting on the answer, so they stay
+   * request/response whatever this says. See `inventory.port.ts`.
+   *
+   * `amqp` needs `AmqpInventoryDispatch.publish` finished first; the module
+   * refuses to start otherwise rather than dropping releases on the floor.
+   */
+  INVENTORY_DISPATCH_TRANSPORT: z.enum(['http', 'amqp']).default('http'),
+  /** Unused while the transport is `http`. */
+  RABBITMQ_URL: optionalString.refine(
+    (value) => value === undefined || /^amqps?:\/\//.test(value),
+    'RABBITMQ_URL must start with amqp:// or amqps://',
+  ),
+
+  /**
    * Full connection string. When set it wins over the discrete REDIS_* fields
    * below, which then only serve as documentation of the same values.
    * `rediss://` selects TLS without needing REDIS_TLS.
