@@ -1,72 +1,128 @@
 import {
-  Controller,
-  Get,
-  Post,
   Body,
-  Patch,
-  Param,
+  Controller,
   Delete,
-  Req,
+  Get,
+  HttpCode,
+  HttpStatus,
+  NotFoundException,
+  Post,
   Res,
-  BadRequestException,
 } from '@nestjs/common';
-import type { Request, Response } from 'express';
-import { CartService } from './cart.service';
-import { CreateCartDto } from './dto/create-cart.dto';
-import { UpdateCartDto } from './dto/update-cart.dto';
-import { randomUUID } from 'node:crypto';
+import type { Response } from 'express';
 
+import type { CallContext } from '../inventory';
+import { CART_SESSION_HEADER } from './cart.constants';
+import { CartService } from './cart.service';
+import { CartSessionId } from './decorators/cart-session.decorator';
+import { RequestContext } from './decorators/request-context.decorator';
+import { CheckoutCartDto } from './dto/checkout-cart.dto';
+import { SetCartItemsDto } from './dto/set-cart-items.dto';
+import type { CartLine, CheckoutResult } from './cart.types';
+
+/**
+ * The cart's HTTP surface.
+ *
+ * Transport only: reading headers, choosing status codes, and turning a
+ * missing cart into a 404. Deciding which session a request belongs to is
+ * `CartService.resolveSession` — that is a rule about carts, not about HTTP,
+ * and it used to live here.
+ */
 @Controller('cart')
 export class CartController {
   constructor(private readonly cartService: CartService) {}
 
+  /**
+   * Sets the quantity of each named line.
+   *
+   * Absolute, not additive: sending `p1: 10` leaves the cart holding 10 of
+   * `p1` however many it held before, and sending the same body twice changes
+   * nothing the second time. A quantity of zero removes the line.
+   *
+   * 200 rather than 201: the same request creates a cart or updates one, and
+   * which of the two happened is not something the caller has to care about.
+   */
   @Post()
-  async create(
-    @Body() createCartDto: CreateCartDto,
-    @Req() req: Request,
+  @HttpCode(HttpStatus.OK)
+  async setItems(
+    @Body() dto: SetCartItemsDto,
+    @CartSessionId() claimed: string | null,
+    @RequestContext() context: CallContext,
     @Res({ passthrough: true }) res: Response,
-  ) {
-    let cartSessionId = (req.headers['cart-session-id'] as string) || null;
+  ): Promise<CartLine[]> {
+    const { cartSessionId } = await this.cartService.resolveSession(claimed);
+    // Echoed on every response, not only when the session is new: a client
+    // that loses track of its id can always recover it from the last reply.
+    res.setHeader(CART_SESSION_HEADER, cartSessionId);
 
-    if (cartSessionId) {
-      const exist = await this.cartService.checkCartSession(cartSessionId);
-      if (!exist) cartSessionId = null;
-    }
-
-    if (!cartSessionId) {
-      cartSessionId = randomUUID();
-      await this.cartService.createCartSession(cartSessionId);
-      res.setHeader('cart-session-id', cartSessionId); // sent to the client
-    }
-
-    return this.cartService.create(createCartDto, cartSessionId);
+    return this.cartService.setLines(dto.items, cartSessionId, context);
   }
 
+  /** The cart behind the claimed session. */
   @Get()
-  async findAll(@Req() req: Request) {
-    const cartSessionId = (req.headers['cart-session-id'] as string) || null;
-    if (!cartSessionId) {
-      throw new BadRequestException('Cart session ID is required');
+  async getCart(
+    @CartSessionId() claimed: string | null,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<CartLine[]> {
+    const cartSessionId = await this.requireSession(claimed);
+    res.setHeader(CART_SESSION_HEADER, cartSessionId);
+
+    return this.cartService.lines(cartSessionId);
+  }
+
+  /**
+   * Hands the cart's hold to an order and ends the cart.
+   *
+   * Called by the order service, not by a browser: it names an order that
+   * must already exist, so that the reference on inventory's ledger points at
+   * something real. The gateway should keep this off public routes for the
+   * same reason it does the stock-mutation endpoints.
+   *
+   * 409 for an empty cart — there is nothing to check out, and a caller that
+   * asked has got its state wrong. 404 for a session that has already gone.
+   */
+  @Post('checkout')
+  @HttpCode(HttpStatus.OK)
+  async checkout(
+    @Body() dto: CheckoutCartDto,
+    @CartSessionId() claimed: string | null,
+    @RequestContext() context: CallContext,
+  ): Promise<CheckoutResult> {
+    const cartSessionId = await this.requireSession(claimed);
+    return this.cartService.checkout(cartSessionId, dto.orderId, context);
+  }
+
+  /**
+   * Abandons the cart, handing every held unit straight back to inventory
+   * rather than waiting for it to expire.
+   *
+   * Idempotent, and deliberately quiet about a cart that has already gone: a
+   * client cancelling twice, or cancelling something that expired a moment
+   * earlier, has got what it asked for either way.
+   */
+  @Delete()
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async abandon(@CartSessionId() claimed: string | null): Promise<void> {
+    if (!claimed) return;
+    await this.cartService.releaseSession(claimed, 'abandoned');
+  }
+
+  /**
+   * A cart that has expired is gone, not malformed — 404 rather than the 400
+   * this used to answer, so a client can tell "your id is stale, start again"
+   * from "your request was wrong".
+   */
+  private async requireSession(claimed: string | null): Promise<string> {
+    if (!claimed) {
+      throw new NotFoundException(
+        `No cart session; send one in the '${CART_SESSION_HEADER}' header`,
+      );
     }
-    if (cartSessionId) {
-      const exist = await this.cartService.checkCartSession(cartSessionId);
-      if (!exist) throw new BadRequestException('Cart session ID is invalid');
+
+    if (!(await this.cartService.touchSession(claimed))) {
+      throw new NotFoundException('This cart has expired');
     }
-    return this.cartService.getCart(cartSessionId);
-  }
 
-  @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.cartService.findOne(+id);
-  }
-
-  @Patch(':id')
-  update(@Param('id') id: string, @Body() updateCartDto: UpdateCartDto) {
-    return this.cartService.update(+id, updateCartDto);
-  }
-
-  @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.cartService.remove(+id);
+    return claimed;
   }
 }

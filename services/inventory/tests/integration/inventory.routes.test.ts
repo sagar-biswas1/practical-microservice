@@ -8,6 +8,7 @@ import { InMemoryInventoryRepository } from "../helpers/in-memory-inventory-repo
 
 const BASE = `${API_PREFIX}/inventory`;
 const PRODUCT_ID = "1c9e6679-7425-40de-944b-e07fc1f90ae7";
+const SECOND_PRODUCT_ID = "b4f0e9d2-3a71-4c58-9f1e-2d6c8a5b7e34";
 
 const validPayload = {
   sku: "kbd-100",
@@ -359,6 +360,147 @@ describe("inventory API", () => {
       ({ app } = buildApp(new InMemoryInventoryRepository([item])));
 
       await request(app).delete(`${BASE}/${item.id}`).expect(204);
+    });
+  });
+
+  describe("POST /inventory/bulk/reserve", () => {
+    /** Two provisioned products, returned as `{ productId, id }` pairs. */
+    const seedTwo = async () => {
+      const first = await request(app).post(BASE).send(validPayload).expect(201);
+      const second = await request(app)
+        .post(BASE)
+        .send({ ...validPayload, sku: "mse-200", productId: SECOND_PRODUCT_ID, quantity: 4 })
+        .expect(201);
+      return [first.body.data, second.body.data];
+    };
+
+    it("reserves across products in one call", async () => {
+      await seedTwo();
+
+      const response = await request(app)
+        .post(`${BASE}/bulk/reserve`)
+        .send({
+          items: [
+            { productId: PRODUCT_ID, quantity: 2 },
+            { productId: SECOND_PRODUCT_ID, quantity: 1 },
+          ],
+          reference: "cart_1",
+        })
+        .expect(200);
+
+      expect(response.body.data).toHaveLength(2);
+      const byProduct = new Map(
+        (response.body.data as Array<{ productId: string }>).map((item) => [item.productId, item]),
+      );
+      expect(byProduct.get(PRODUCT_ID)).toMatchObject({ reserved: 2, available: 98 });
+      expect(byProduct.get(SECOND_PRODUCT_ID)).toMatchObject({ reserved: 1, available: 3 });
+    });
+
+    it("is not shadowed by the /:id/reserve route", async () => {
+      await seedTwo();
+
+      // `/bulk/reserve` would otherwise match `/:id/reserve` with id="bulk"
+      // and come back as a 422 about a malformed UUID.
+      await request(app)
+        .post(`${BASE}/bulk/reserve`)
+        .send({ items: [{ productId: PRODUCT_ID, quantity: 1 }], reference: "cart_1" })
+        .expect(200);
+    });
+
+    it("returns 409 with one detail per rejected line, changing nothing", async () => {
+      await seedTwo();
+
+      const response = await request(app)
+        .post(`${BASE}/bulk/reserve`)
+        .send({
+          items: [
+            { productId: PRODUCT_ID, quantity: 1 },
+            { productId: SECOND_PRODUCT_ID, quantity: 99 },
+          ],
+          reference: "cart_1",
+        })
+        .expect(409);
+
+      expect(response.body.error.code).toBe("CONFLICT");
+      expect(response.body.error.details).toHaveLength(1);
+      expect(response.body.error.details[0]).toMatchObject({
+        productId: SECOND_PRODUCT_ID,
+        requested: 99,
+        available: 4,
+      });
+
+      // The satisfiable line must not have been applied.
+      const survivor = await request(app).get(`${BASE}?productId=${PRODUCT_ID}`).expect(200);
+      expect(survivor.body.data[0]).toMatchObject({ reserved: 0 });
+    });
+
+    it("reports an unprovisioned product as NOT_FOUND on its line", async () => {
+      await seedTwo();
+
+      const response = await request(app)
+        .post(`${BASE}/bulk/reserve`)
+        .send({
+          items: [{ productId: "7c9e6679-7425-40de-944b-e07fc1f90ae7", quantity: 1 }],
+          reference: "cart_1",
+        })
+        .expect(409);
+
+      expect(response.body.error.details[0]).toMatchObject({ code: "NOT_FOUND" });
+    });
+
+    it("returns 422 for a duplicated productId", async () => {
+      await request(app)
+        .post(`${BASE}/bulk/reserve`)
+        .send({
+          items: [
+            { productId: PRODUCT_ID, quantity: 1 },
+            { productId: PRODUCT_ID, quantity: 2 },
+          ],
+          reference: "cart_1",
+        })
+        .expect(422);
+    });
+
+    it("returns 422 when the cart reference is missing", async () => {
+      await request(app)
+        .post(`${BASE}/bulk/reserve`)
+        .send({ items: [{ productId: PRODUCT_ID, quantity: 1 }] })
+        .expect(422);
+    });
+
+    it("returns 422 for an empty line list", async () => {
+      await request(app)
+        .post(`${BASE}/bulk/reserve`)
+        .send({ items: [], reference: "cart_1" })
+        .expect(422);
+    });
+  });
+
+  describe("POST /inventory/bulk/release", () => {
+    it("returns a cancelled cart's units to the pool", async () => {
+      await request(app).post(BASE).send(validPayload).expect(201);
+      const lines = [{ productId: PRODUCT_ID, quantity: 5 }];
+
+      await request(app)
+        .post(`${BASE}/bulk/reserve`)
+        .send({ items: lines, reference: "cart_1" })
+        .expect(200);
+
+      const response = await request(app)
+        .post(`${BASE}/bulk/release`)
+        .send({ items: lines, reason: "Cart cancelled", reference: "cart_1" })
+        .expect(200);
+
+      expect(response.body.data[0]).toMatchObject({ reserved: 0, available: 100 });
+    });
+
+    it("returns 409 when releasing more than is held", async () => {
+      await request(app).post(BASE).send(validPayload).expect(201);
+
+      await request(app)
+        .post(`${BASE}/bulk/release`)
+        .send({ items: [{ productId: PRODUCT_ID, quantity: 1 }], reference: "cart_1" })
+        .expect(409);
     });
   });
 

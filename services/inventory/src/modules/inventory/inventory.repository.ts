@@ -5,7 +5,7 @@ import type {
   StockMovementHistory,
 } from "../../generated/prisma/client.js";
 import type { PrismaClient } from "../../lib/prisma.js";
-import { NotFoundError } from "../../errors/app-error.js";
+import { InternalServerError, NotFoundError } from "../../errors/app-error.js";
 import { AUDITED_FIELDS } from "./inventory.schema.js";
 import type {
   CreateInventoryItemInput,
@@ -83,6 +83,33 @@ export interface StockChangePlan {
  */
 export type StockChangePlanner = (item: InventoryItem) => StockChangePlan;
 
+/** One line of a bulk transition, as the planner resolved it. */
+export interface BulkStockChangePlan {
+  productId: string;
+  quantity: number;
+  reserved: number;
+  movement: {
+    type: StockMovementTypeValue;
+    quantity: number;
+    reason?: string | undefined;
+    reference?: string | undefined;
+  };
+}
+
+/**
+ * Receives every row the batch addressed, keyed by `productId`, and returns
+ * the desired next state for each line. Invoked *inside* the transaction, so
+ * validation sees committed data; throws a domain error — carrying every
+ * rejected line rather than only the first — when the batch cannot be
+ * satisfied in full.
+ *
+ * A product the batch asked for that has no inventory row is simply absent
+ * from the map; deciding what that means is the planner's job.
+ */
+export type BulkStockChangePlanner = (
+  items: Map<string, InventoryItem>,
+) => BulkStockChangePlan[];
+
 export interface InventoryRepository {
   list(query: ListInventoryQuery): Promise<Paginated<InventoryItem>>;
   findById(id: string): Promise<InventoryItem | null>;
@@ -109,7 +136,28 @@ export interface InventoryRepository {
     id: string,
     plan: StockChangePlanner,
   ): Promise<InventoryItem>;
+  /**
+   * All-or-nothing counterpart to `applyStockChange`, over several products at
+   * once. Reads every addressed row, validates the whole batch, then writes.
+   * One rejected line aborts the lot, so a caller never has to unwind a
+   * half-applied reservation.
+   */
+  applyBulkStockChange(
+    productIds: string[],
+    plan: BulkStockChangePlanner,
+  ): Promise<InventoryItem[]>;
 }
+
+/**
+ * A batch does one update and one ledger row per line where a single
+ * transition does one of each in total, so it needs more room than Prisma's
+ * 5s interactive-transaction default before the driver pulls the transaction
+ * out from under it mid-write.
+ */
+const BULK_TRANSACTION_TIMEOUT_MS = 15_000;
+
+/** How long a batch waits for a connection before giving up on starting. */
+const BULK_TRANSACTION_MAX_WAIT_MS = 5_000;
 
 export class PrismaInventoryRepository implements InventoryRepository {
   constructor(private readonly prisma: PrismaClient) {}
@@ -317,6 +365,76 @@ export class PrismaInventoryRepository implements InventoryRepository {
       // Serializable: two concurrent reservations must not both read the same
       // pre-change level and jointly oversell the item.
       { isolationLevel: "Serializable" },
+    );
+  }
+
+  applyBulkStockChange(
+    productIds: string[],
+    plan: BulkStockChangePlanner,
+  ): Promise<InventoryItem[]> {
+    return this.prisma.$transaction(
+      async (tx) => {
+        const current = await tx.inventoryItem.findMany({
+          where: { productId: { in: productIds } },
+        });
+        const byProductId = new Map(current.map((item) => [item.productId, item]));
+
+        // Throws — with every rejected line attached — if the batch cannot be
+        // satisfied in full. Nothing has been written at this point.
+        const plans = plan(byProductId);
+
+        const targets = plans.map((next) => {
+          const item = byProductId.get(next.productId);
+          if (!item) {
+            // The planner is only ever handed rows that exist, so returning a
+            // line for something else is a bug here, not bad input.
+            throw new InternalServerError(
+              `Bulk plan referenced product '${next.productId}', which was not read`,
+            );
+          }
+          return { next, item };
+        });
+
+        // Locks are taken in primary-key order so two batches over an
+        // overlapping set queue behind each other instead of deadlocking.
+        targets.sort((a, b) => (a.item.id < b.item.id ? -1 : a.item.id > b.item.id ? 1 : 0));
+
+        const updated: InventoryItem[] = [];
+        const movements: Prisma.StockMovementHistoryCreateManyInput[] = [];
+
+        for (const { next, item } of targets) {
+          updated.push(
+            await tx.inventoryItem.update({
+              where: { id: item.id },
+              data: { quantity: next.quantity, reserved: next.reserved },
+            }),
+          );
+
+          movements.push({
+            itemId: item.id,
+            type: next.movement.type,
+            quantityChanged: next.movement.quantity,
+            lastQuantity: item.quantity,
+            reason: next.movement.reason ?? null,
+            reference: next.movement.reference ?? null,
+          });
+        }
+
+        // One statement instead of one per line: the ledger rows are
+        // independent of each other, and on a long batch the round trips are
+        // what hold the transaction — and its locks — open.
+        await tx.stockMovementHistory.createMany({ data: movements });
+
+        return updated;
+      },
+      {
+        // Same reasoning as the single-item path, over more rows: the reads
+        // that feed the planner and the writes that follow must not interleave
+        // with a concurrent reservation on any line in the batch.
+        isolationLevel: "Serializable",
+        timeout: BULK_TRANSACTION_TIMEOUT_MS,
+        maxWait: BULK_TRANSACTION_MAX_WAIT_MS,
+      },
     );
   }
 }

@@ -1,4 +1,10 @@
-import { ConflictError, NotFoundError } from "../../errors/app-error.js";
+import {
+  ConflictError,
+  ErrorCode,
+  isAppError,
+  NotFoundError,
+  type ErrorDetail,
+} from "../../errors/app-error.js";
 import {
   availableStock,
   isLowStock,
@@ -10,7 +16,9 @@ import {
   planSale,
   assertInvariants,
 } from "./inventory.rules.js";
+import type { StockLevels } from "./inventory.rules.js";
 import type {
+  BulkStockChangePlan,
   InventoryAuditLog,
   InventoryItem,
   InventoryRepository,
@@ -19,6 +27,8 @@ import type {
 } from "./inventory.repository.js";
 import type {
   AdjustStockInput,
+  BulkReleaseStockInput,
+  BulkReserveStockInput,
   CreateInventoryItemInput,
   FulfilStockInput,
   ListAuditLogsQuery,
@@ -152,6 +162,110 @@ export class InventoryService {
     return this.applyChange(id, "RELEASE", input.quantity, input, (item) =>
       planRelease(item, input.quantity),
     );
+  }
+
+  /**
+   * Reserves stock for a whole cart in one all-or-nothing step.
+   *
+   * Reserving line by line would leave a cart holding units from the lines
+   * that succeeded when a later one is short, and the caller unwinding them
+   * by hand — a compensating release that can itself fail. Here the batch
+   * either holds everything it asked for or holds nothing.
+   */
+  reserveMany(input: BulkReserveStockInput): Promise<InventoryItemView[]> {
+    return this.applyBulkChange("RESERVATION", "reserved", input, planReservation);
+  }
+
+  /**
+   * Hands a whole cart's reservations back, e.g. when it is cancelled or
+   * abandoned.
+   *
+   * Strict, like the single-item release: releasing more than is held is a
+   * conflict rather than a no-op, so a double-cancel is reported instead of
+   * silently inflating available stock. That does mean a caller retrying a
+   * release that already succeeded gets a 409 — the per-line `code` in the
+   * error details is what tells it the difference between "already released"
+   * and "never reserved".
+   */
+  releaseMany(input: BulkReleaseStockInput): Promise<InventoryItemView[]> {
+    return this.applyBulkChange("RELEASE", "released", input, planRelease);
+  }
+
+  /**
+   * Validates every line against freshly-read state before any of them is
+   * written, then applies the batch inside one transaction.
+   *
+   * Failures are collected rather than thrown on sight: a cart that is short
+   * on three items should learn all three at once, not discover them one
+   * request at a time.
+   */
+  private async applyBulkChange(
+    type: StockMovementTypeValue,
+    action: string,
+    input: BulkReserveStockInput,
+    plan: (item: StockLevels, quantity: number) => StockLevels,
+  ): Promise<InventoryItemView[]> {
+    const updated = await this.repository.applyBulkStockChange(
+      input.items.map((line) => line.productId),
+      (byProductId) => {
+        const plans: BulkStockChangePlan[] = [];
+        const failures: ErrorDetail[] = [];
+
+        for (const line of input.items) {
+          const item = byProductId.get(line.productId);
+
+          if (!item) {
+            failures.push({
+              field: line.productId,
+              productId: line.productId,
+              code: ErrorCode.NOT_FOUND,
+              message: `No inventory item exists for product '${line.productId}'`,
+              requested: line.quantity,
+            });
+            continue;
+          }
+
+          try {
+            const next = plan(item, line.quantity);
+            assertInvariants(next);
+            plans.push({
+              productId: line.productId,
+              ...next,
+              movement: {
+                type,
+                quantity: line.quantity,
+                reason: input.reason,
+                reference: input.reference,
+              },
+            });
+          } catch (error) {
+            // Only the domain's own refusals are per-line data; anything else
+            // is a real fault and belongs to the error handler.
+            if (!isAppError(error)) throw error;
+            failures.push({
+              field: line.productId,
+              productId: line.productId,
+              code: error.code,
+              message: error.message,
+              requested: line.quantity,
+              available: availableStock(item),
+              reserved: item.reserved,
+            });
+          }
+        }
+
+        if (failures.length > 0) {
+          throw new ConflictError(
+            `${failures.length} of ${input.items.length} lines could not be ${action}; nothing was changed`,
+            failures,
+          );
+        }
+
+        return plans;
+      },
+    );
+
+    return updated.map(toInventoryItemView);
   }
 
   /** Ship reserved stock: drops both on-hand and reserved. */

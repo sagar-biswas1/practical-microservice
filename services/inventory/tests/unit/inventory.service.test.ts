@@ -329,6 +329,192 @@ describe("InventoryService", () => {
     });
   });
 
+  describe("reserveMany", () => {
+    /** Seeds several items and returns them in the order given. */
+    const seedMany = (...overrides: Array<Record<string, unknown>>) => {
+      const items = overrides.map((override) =>
+        InMemoryInventoryRepository.buildItem(override),
+      );
+      repository = new InMemoryInventoryRepository(items);
+      service = new InventoryService(repository);
+      return items;
+    };
+
+    it("reserves every line of a cart in one step", async () => {
+      const [first, second] = seedMany(
+        { quantity: 10, reserved: 0 },
+        { quantity: 5, reserved: 0 },
+      );
+
+      const result = await service.reserveMany({
+        items: [
+          { productId: first!.productId, quantity: 3 },
+          { productId: second!.productId, quantity: 2 },
+        ],
+        reference: "cart_1",
+      });
+
+      expect(result).toHaveLength(2);
+      const byProduct = new Map(result.map((view) => [view.productId, view]));
+      expect(byProduct.get(first!.productId)).toMatchObject({ reserved: 3, available: 7 });
+      expect(byProduct.get(second!.productId)).toMatchObject({ reserved: 2, available: 3 });
+    });
+
+    it("writes one ledger row per line, carrying the cart reference", async () => {
+      const [first, second] = seedMany(
+        { quantity: 10, reserved: 0 },
+        { quantity: 5, reserved: 0 },
+      );
+
+      await service.reserveMany({
+        items: [
+          { productId: first!.productId, quantity: 3 },
+          { productId: second!.productId, quantity: 2 },
+        ],
+        reference: "cart_1",
+      });
+
+      expect(repository.movementCount).toBe(2);
+      const history = await service.listMovements(first!.id, { page: 1, limit: 20 });
+      expect(history.items[0]).toMatchObject({
+        type: "RESERVATION",
+        quantityChanged: 3,
+        lastQuantity: 10,
+        reference: "cart_1",
+      });
+    });
+
+    it("leaves every line untouched when one of them is short", async () => {
+      const [plenty, scarce] = seedMany(
+        { quantity: 10, reserved: 0 },
+        { quantity: 1, reserved: 0 },
+      );
+
+      await expect(
+        service.reserveMany({
+          items: [
+            { productId: plenty!.productId, quantity: 3 },
+            { productId: scarce!.productId, quantity: 9 },
+          ],
+          reference: "cart_1",
+        }),
+      ).rejects.toThrowError(ConflictError);
+
+      // The line that could have succeeded must not have been written.
+      expect(await service.getById(plenty!.id)).toMatchObject({ reserved: 0 });
+      expect(repository.movementCount).toBe(0);
+    });
+
+    it("reports every rejected line, not just the first", async () => {
+      const [ok, scarce] = seedMany({ quantity: 10, reserved: 0 }, { quantity: 1, reserved: 0 });
+      const missing = "1c9e6679-7425-40de-944b-e07fc1f90ae7";
+
+      const error = await service
+        .reserveMany({
+          items: [
+            { productId: scarce!.productId, quantity: 9 },
+            { productId: ok!.productId, quantity: 1 },
+            { productId: missing, quantity: 1 },
+          ],
+          reference: "cart_1",
+        })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ConflictError);
+      const details = (error as ConflictError).details ?? [];
+      expect(details).toHaveLength(2);
+      expect(details).toContainEqual(
+        expect.objectContaining({
+          productId: scarce!.productId,
+          code: "CONFLICT",
+          requested: 9,
+          available: 1,
+        }),
+      );
+      expect(details).toContainEqual(
+        expect.objectContaining({ productId: missing, code: "NOT_FOUND" }),
+      );
+    });
+
+    it("refuses a batch whose total exceeds what a single item has", async () => {
+      const [only] = seedMany({ quantity: 5, reserved: 0 });
+
+      // Two lines for one product are rejected by the schema, so the way a
+      // batch oversells a single item is by asking for more than it holds.
+      await expect(
+        service.reserveMany({
+          items: [{ productId: only!.productId, quantity: 6 }],
+          reference: "cart_1",
+        }),
+      ).rejects.toThrowError(ConflictError);
+    });
+  });
+
+  describe("releaseMany", () => {
+    const seedMany = (...overrides: Array<Record<string, unknown>>) => {
+      const items = overrides.map((override) =>
+        InMemoryInventoryRepository.buildItem(override),
+      );
+      repository = new InMemoryInventoryRepository(items);
+      service = new InventoryService(repository);
+      return items;
+    };
+
+    it("hands a whole cart's reservations back", async () => {
+      const [first, second] = seedMany(
+        { quantity: 10, reserved: 3 },
+        { quantity: 5, reserved: 2 },
+      );
+
+      const result = await service.releaseMany({
+        items: [
+          { productId: first!.productId, quantity: 3 },
+          { productId: second!.productId, quantity: 2 },
+        ],
+        reason: "Cart cancelled",
+        reference: "cart_1",
+      });
+
+      const byProduct = new Map(result.map((view) => [view.productId, view]));
+      expect(byProduct.get(first!.productId)).toMatchObject({ reserved: 0, available: 10 });
+      expect(byProduct.get(second!.productId)).toMatchObject({ reserved: 0, available: 5 });
+    });
+
+    it("round-trips a reservation exactly", async () => {
+      const [item] = seedMany({ quantity: 10, reserved: 0 });
+      const lines = [{ productId: item!.productId, quantity: 4 }];
+
+      await service.reserveMany({ items: lines, reference: "cart_1" });
+      await service.releaseMany({ items: lines, reference: "cart_1" });
+
+      expect(await service.getById(item!.id)).toMatchObject({
+        quantity: 10,
+        reserved: 0,
+        available: 10,
+      });
+    });
+
+    it("refuses to release more than is held, changing nothing", async () => {
+      const [first, second] = seedMany(
+        { quantity: 10, reserved: 3 },
+        { quantity: 5, reserved: 1 },
+      );
+
+      await expect(
+        service.releaseMany({
+          items: [
+            { productId: first!.productId, quantity: 3 },
+            { productId: second!.productId, quantity: 2 },
+          ],
+          reference: "cart_1",
+        }),
+      ).rejects.toThrowError(ConflictError);
+
+      expect(await service.getById(first!.id)).toMatchObject({ reserved: 3 });
+      expect(repository.movementCount).toBe(0);
+    });
+  });
+
   describe("remove", () => {
     it("blocks deletion while units are reserved", async () => {
       const item = seedWith({ quantity: 10, reserved: 3 });

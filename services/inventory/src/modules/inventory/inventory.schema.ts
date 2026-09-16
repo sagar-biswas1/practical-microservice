@@ -115,6 +115,55 @@ export const adjustStockSchema = z.strictObject({
   reference,
 });
 
+/**
+ * Cap on the lines one bulk transition may carry. Every line is a row read, an
+ * update and a ledger entry inside a single serializable transaction, so this
+ * ceiling is what keeps that transaction short enough not to starve the
+ * single-item endpoints running beside it.
+ */
+export const MAX_BULK_LINES = 50;
+
+/**
+ * Lines are addressed by `productId` rather than by inventory id. A cart holds
+ * product ids and nothing else, so keying on the inventory id would force it
+ * to resolve every line to one first — a round trip per item, and a window in
+ * which the mapping it resolved can change before the reservation lands.
+ */
+const bulkStockLineSchema = z.strictObject({
+  productId: z.uuid("productId must be a valid UUID"),
+  quantity: positiveQuantity,
+});
+
+const bulkStockLines = z
+  .array(bulkStockLineSchema)
+  .min(1, "At least one line is required")
+  .max(MAX_BULK_LINES, `A bulk transition covers at most ${MAX_BULK_LINES} lines`)
+  .refine(
+    (lines) => new Set(lines.map((line) => line.productId)).size === lines.length,
+    "Each productId may appear only once; combine duplicates into a single line",
+  );
+
+/**
+ * Reserves stock for a whole cart in one all-or-nothing step.
+ *
+ * `reference` is mandatory, for the same reason it is on a sale: these units
+ * are held on behalf of something outside this service, and a batch of
+ * ledger rows that cannot be traced back to the cart that caused them cannot
+ * be reconciled — or released — afterwards.
+ */
+export const bulkReserveStockSchema = z.strictObject({
+  items: bulkStockLines,
+  reason,
+  reference: z
+    .string()
+    .trim()
+    .min(1, "A bulk reservation must reference the cart or order it is held for")
+    .max(120),
+});
+
+/** Same shape: cancelling a cart hands back exactly what creating it took. */
+export const bulkReleaseStockSchema = bulkReserveStockSchema;
+
 export const listInventoryQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
@@ -163,6 +212,9 @@ export type ReceiveStockInput = z.infer<typeof receiveStockSchema>;
 export type SellStockInput = z.infer<typeof sellStockSchema>;
 export type ReturnStockInput = z.infer<typeof returnStockSchema>;
 export type AdjustStockInput = z.infer<typeof adjustStockSchema>;
+export type BulkStockLine = z.infer<typeof bulkStockLineSchema>;
+export type BulkReserveStockInput = z.infer<typeof bulkReserveStockSchema>;
+export type BulkReleaseStockInput = z.infer<typeof bulkReleaseStockSchema>;
 export type ListInventoryQuery = z.infer<typeof listInventoryQuerySchema>;
 export type ListAuditLogsQuery = z.infer<typeof listAuditLogsQuerySchema>;
 export type ListMovementsQuery = z.infer<typeof listMovementsQuerySchema>;

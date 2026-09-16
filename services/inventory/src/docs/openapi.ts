@@ -4,11 +4,14 @@ import { ACTOR_HEADER } from "../middlewares/request-context.js";
 import { API_PREFIX } from "../routes/index.js";
 import {
   adjustStockSchema,
+  bulkReleaseStockSchema,
+  bulkReserveStockSchema,
   createInventoryItemSchema,
   inventoryIdParamsSchema,
   listAuditLogsQuerySchema,
   listInventoryQuerySchema,
   listMovementsQuerySchema,
+  MAX_BULK_LINES,
   reserveStockSchema,
   sellStockSchema,
   skuParamsSchema,
@@ -216,6 +219,78 @@ const transitionPaths: Record<string, JsonSchema> = Object.fromEntries(
   ]),
 );
 
+/**
+ * The batched transitions. They are not part of the `transitions` table above
+ * because they differ in every respect that matters: a body of lines rather
+ * than one quantity, an array response, and a 409 whose `details` carry a row
+ * per rejected line.
+ */
+interface BulkTransition {
+  path: string;
+  operationId: string;
+  summary: string;
+  description: string;
+  schema: typeof bulkReserveStockSchema;
+  example: Record<string, unknown>;
+}
+
+const bulkTransitions: BulkTransition[] = [
+  {
+    path: "reserve",
+    operationId: "reserveStockBulk",
+    summary: "Reserve stock for a whole cart",
+    description:
+      `Holds units across up to ${MAX_BULK_LINES} products in one all-or-nothing step, for a cart being created.\n\nLines are addressed by \`productId\`, not by inventory id — a cart holds product ids and nothing else. Every line is checked against freshly-read stock before any of them is written, so the batch either holds everything it asked for or holds nothing; there is no partial reservation to unwind.\n\nRefused with a 409 when any line cannot be satisfied. **Every** rejected line is reported, not just the first: \`error.details\` carries one entry per failure with \`productId\`, a \`code\` (\`NOT_FOUND\` for a product with no stock record, \`CONFLICT\` for one that is short), \`requested\`, and the \`available\` and \`reserved\` figures behind the refusal — enough to tell a shopper exactly which items to reduce and by how much.`,
+    schema: bulkReserveStockSchema,
+    example: {
+      items: [
+        { productId: "1c9e6679-7425-40de-944b-e07fc1f90ae7", quantity: 2 },
+        { productId: "b4f0e9d2-3a71-4c58-9f1e-2d6c8a5b7e34", quantity: 1 },
+      ],
+      reference: "cart_9f2c1b",
+    },
+  },
+  {
+    path: "release",
+    operationId: "releaseStockBulk",
+    summary: "Release a whole cart's reservations",
+    description:
+      "Hands back everything a cart was holding — cancellation, abandonment, or a checkout that fell through. All-or-nothing and reported per line, exactly as the bulk reservation is.\n\nStrict, like the single-item release: asking to release more than is held is a 409 rather than a no-op, so a double-cancel surfaces instead of silently inflating available stock. A caller retrying a release that already succeeded therefore gets a 409 — the per-line `code` is what distinguishes it from a release that was never valid.",
+    schema: bulkReleaseStockSchema,
+    example: {
+      items: [
+        { productId: "1c9e6679-7425-40de-944b-e07fc1f90ae7", quantity: 2 },
+        { productId: "b4f0e9d2-3a71-4c58-9f1e-2d6c8a5b7e34", quantity: 1 },
+      ],
+      reason: "Cart cancelled",
+      reference: "cart_9f2c1b",
+    },
+  },
+];
+
+const bulkTransitionPaths: Record<string, JsonSchema> = Object.fromEntries(
+  bulkTransitions.map((transition) => [
+    `${API_PREFIX}/inventory/bulk/${transition.path}`,
+    {
+      post: {
+        tags: ["Stock movements"],
+        operationId: transition.operationId,
+        summary: transition.summary,
+        description: transition.description,
+        security: [{ bearerAuth: [] }],
+        requestBody: jsonBody(transition.schema, { example: transition.example }),
+        responses: {
+          "200": successResponse("Every affected item, with its derived stock figures.", {
+            type: "array",
+            items: { $ref: "#/components/schemas/InventoryItem" },
+          }),
+          ...errorResponses("400", "401", "403", "409", "413", "422", "429", "500", "503"),
+        },
+      },
+    },
+  ]),
+);
+
 export const openapiDocument: OpenApiDocument = {
   openapi: "3.1.0",
   info: {
@@ -254,6 +329,8 @@ export const openapiDocument: OpenApiDocument = {
   paths: {
     "/": rootPath(env.SERVICE_NAME),
     ...healthPaths(API_PREFIX, env.SERVICE_NAME),
+
+    ...bulkTransitionPaths,
 
     [`${API_PREFIX}/inventory`]: {
       get: {
