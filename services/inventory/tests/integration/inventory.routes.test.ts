@@ -529,4 +529,38 @@ describe("inventory API", () => {
       expect(response.body).toMatchObject({ success: false, error: { code: "NOT_FOUND" } });
     });
   });
+  describe("GET /health/ready", () => {
+    it("reports the broker as disabled when none is configured", async () => {
+      const response = await request(app).get(`${API_PREFIX}/health/ready`).expect(200);
+
+      expect(response.body.data.dependencies.broker).toEqual({
+        enabled: false,
+        connected: false,
+      });
+    });
+
+    it("reports the consumer's status when a broker is configured, without gating on it", async () => {
+      const disconnected = createApp({
+        inventoryService: new InventoryService(new InMemoryInventoryRepository()),
+        checkReadiness: async () => {},
+        brokerStatus: () => ({
+          enabled: true,
+          connected: false,
+          broker: "localhost:5672/",
+          queue: "inventory.stock",
+          inFlight: 0,
+        }),
+      });
+
+      const response = await request(disconnected).get(`${API_PREFIX}/health/ready`).expect(200);
+
+      expect(response.body.data).toEqual({
+        status: "ready",
+        dependencies: {
+          database: "up",
+          broker: expect.objectContaining({ enabled: true, connected: false, queue: "inventory.stock" }),
+        },
+      });
+    });
+  });
 });

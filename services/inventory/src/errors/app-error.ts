@@ -89,6 +89,17 @@ export class ConflictError extends AppError {
   }
 }
 
+/**
+ * The operation carried an idempotency key that has already been applied.
+ * A 409 like any conflict, but its own class because the right response is
+ * the opposite of a conflict's: the caller has nothing left to do.
+ */
+export class DuplicateOperationError extends AppError {
+  constructor(idempotencyKey: string) {
+    super(`Operation '${idempotencyKey}' has already been applied`, 409, ErrorCode.CONFLICT);
+  }
+}
+
 export class UnprocessableEntityError extends AppError {
   constructor(message = "Unprocessable entity", details?: ErrorDetail[]) {
     super(message, 422, ErrorCode.UNPROCESSABLE_ENTITY, { details });

@@ -13,7 +13,11 @@ export {
   type StockChangeOptions,
 } from './inventory.port';
 export {
+  INVENTORY_DEAD_LETTER_EXCHANGE,
   INVENTORY_EXCHANGE,
+  INVENTORY_STOCK_DEAD_QUEUE,
+  INVENTORY_STOCK_QUEUE,
+  INVENTORY_TOPOLOGY,
   InventoryRoutingKey,
   buildStockChangeMessage,
   routingKeyFor,

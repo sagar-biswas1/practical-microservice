@@ -53,6 +53,13 @@ pnpm db:migrate      # create tables — see "Database layout" first
 pnpm dev             # run the gateway and every service concurrently
 ```
 
+The cart service also needs Redis, and RabbitMQ if its stock releases are switched onto the
+broker (`INVENTORY_DISPATCH_TRANSPORT=amqp`). Both come from `docker-compose.yml`:
+`pnpm infra:up` starts them, `pnpm redis:up` / `pnpm rabbitmq:up` start one, and the RabbitMQ
+management UI is at `http://localhost:15672` (guest / guest). See
+[services/cart/README.md](services/cart/README.md#talking-to-other-services) for what travels
+over the broker and what a consumer on the inventory side must do.
+
 Root scripts (`dev`, `build`, `start`, `test`, `typecheck`, `db:generate`, `db:migrate`,
 `db:push`) fan out to every workspace package via `pnpm -r`. Run one package on its own with
 `pnpm --filter @services/product <script>` or `pnpm --filter api-gateway <script>`.
@@ -560,6 +567,34 @@ neither a downward adjustment nor a hand-edited `quantity` can cut into units al
 to an order. These checks run
 *inside* a `Serializable` transaction against freshly-read state, so two concurrent
 reservations cannot both read the same pre-change level and jointly oversell.
+
+#### Stock events from the broker
+
+Besides HTTP, the inventory service consumes stock events from RabbitMQ when `RABBITMQ_URL`
+is set. The cart service publishes `inventory.stock.release` when a cart expires or is
+abandoned; the consumer in `src/modules/inventory/inventory.consumer.ts` applies it through
+the same `releaseMany` the bulk endpoint uses, with the same strictness.
+
+Delivery is at-least-once, so every consumed message's id is written to `processed_messages`
+*inside the transaction* that changes stock. A redelivery fails on that primary key before it
+reads a row, and a crash between "applied" and "recorded" cannot happen because they are one
+commit. The outcomes:
+
+| What happened                                        | Outcome                                          |
+| ---------------------------------------------------- | ------------------------------------------------ |
+| Applied                                              | ack                                              |
+| Already applied (same `messageId`)                   | ack, logged as a duplicate                       |
+| Inventory refused it (409-shaped), malformed, unknown type | nack without requeue → `inventory.stock.dead` |
+| Database or anything unexpected                      | nack with requeue, after `RABBITMQ_REQUEUE_DELAY_MS` |
+
+`inventory.stock.dead` is bound to the fanout exchange `inventory.dlx`; nothing consumes it. It
+is where a release that could never be applied waits for a person, visible in the management
+UI at `http://localhost:15672`. The topology is declared identically by both services — see
+`services/inventory/src/messaging/inventory-events.ts` and
+`services/cart/src/inventory/inventory.messages.ts` — and a change to either must ship to both.
+
+The migration `20260916000000_add_processed_messages` adds the table; run `pnpm db:migrate`
+in `services/inventory` (or `db:deploy` in production) before enabling the consumer.
 
 ### User service (`:4003/api/v1`)
 

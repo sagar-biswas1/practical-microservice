@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { ConflictError, NotFoundError } from "../../src/errors/app-error.js";
+import {
+  ConflictError,
+  DuplicateOperationError,
+  NotFoundError,
+} from "../../src/errors/app-error.js";
 import { InventoryService } from "../../src/modules/inventory/inventory.service.js";
 import { InMemoryInventoryRepository } from "../helpers/in-memory-inventory-repository.js";
 
@@ -529,6 +533,58 @@ describe("InventoryService", () => {
       await service.remove(item.id);
 
       expect(repository.size).toBe(0);
+    });
+  });
+  describe("releaseMany with an idempotency key", () => {
+    const line = (item: { productId: string }, quantity: number) => ({
+      productId: item.productId,
+      quantity,
+    });
+
+    it("applies the first attempt and refuses a repeat without touching stock", async () => {
+      const item = seedWith({ quantity: 10, reserved: 4 });
+      const input = { items: [line(item, 4)], reference: "cart_1" };
+      const key = { messageId: "msg-1", type: "inventory.stock.release", reference: "cart_1" };
+
+      const [first] = await service.releaseMany(input, { idempotencyKey: key });
+      expect(first?.reserved).toBe(0);
+
+      await expect(
+        service.releaseMany(input, { idempotencyKey: key }),
+      ).rejects.toThrowError(DuplicateOperationError);
+
+      const stored = await repository.findById(item.id);
+      expect(stored?.reserved).toBe(0);
+      expect(repository.movementCount).toBe(1);
+    });
+
+    it("does not remember a key whose batch was refused, so a later retry is not mistaken for a duplicate", async () => {
+      const item = seedWith({ quantity: 10, reserved: 0 });
+      const key = { messageId: "msg-2", type: "inventory.stock.release" };
+
+      // Nothing is held, so this is a conflict — and must not be recorded.
+      await expect(
+        service.releaseMany(
+          { items: [line(item, 1)], reference: "cart_2" },
+          { idempotencyKey: key },
+        ),
+      ).rejects.toThrowError(ConflictError);
+      expect(repository.processedMessageCount).toBe(0);
+    });
+
+    it("treats two different keys for the same reference as two releases", async () => {
+      const item = seedWith({ quantity: 10, reserved: 4 });
+      const input = { items: [line(item, 2)], reference: "cart_3" };
+
+      await service.releaseMany(input, {
+        idempotencyKey: { messageId: "msg-3a", type: "inventory.stock.release" },
+      });
+      await service.releaseMany(input, {
+        idempotencyKey: { messageId: "msg-3b", type: "inventory.stock.release" },
+      });
+
+      const stored = await repository.findById(item.id);
+      expect(stored?.reserved).toBe(0);
     });
   });
 });

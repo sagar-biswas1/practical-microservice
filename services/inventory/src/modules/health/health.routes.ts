@@ -1,15 +1,29 @@
 import { Router, type RequestHandler } from "express";
 import { env } from "../../config/env.js";
+import type { BrokerStatus } from "../../messaging/types.js";
 import { asyncHandler } from "../../utils/async-handler.js";
 import { sendSuccess } from "../../utils/api-response.js";
 
 export type ReadinessCheck = () => Promise<void>;
 
 /**
+ * Reported, not gating. The broker only feeds this service work; losing it
+ * means releases wait in the queue, not that requests cannot be served, and
+ * failing readiness on it would take every replica out of rotation over a
+ * dependency the HTTP path never touches.
+ */
+export type BrokerStatusCheck = () => BrokerStatus;
+
+const NO_BROKER: BrokerStatusCheck = () => ({ enabled: false, connected: false });
+
+/**
  * `/health/live`  — process is up (orchestrator restart signal).
  * `/health/ready` — dependencies reachable (load-balancer traffic signal).
  */
-export function createHealthRouter(checkReadiness?: ReadinessCheck): Router {
+export function createHealthRouter(
+  checkReadiness?: ReadinessCheck,
+  brokerStatus: BrokerStatusCheck = NO_BROKER,
+): Router {
   const router = Router();
 
   const liveness: RequestHandler = (_req, res) => {
@@ -27,7 +41,7 @@ export function createHealthRouter(checkReadiness?: ReadinessCheck): Router {
     "/ready",
     asyncHandler(async (_req, res) => {
       if (!checkReadiness) {
-        sendSuccess(res, { status: "ready", dependencies: {} });
+        sendSuccess(res, { status: "ready", dependencies: { broker: brokerStatus() } });
         return;
       }
 
@@ -50,7 +64,10 @@ export function createHealthRouter(checkReadiness?: ReadinessCheck): Router {
         return;
       }
 
-      sendSuccess(res, { status: "ready", dependencies: { database: "up" } });
+      sendSuccess(res, {
+        status: "ready",
+        dependencies: { database: "up", broker: brokerStatus() },
+      });
     }),
   );
 

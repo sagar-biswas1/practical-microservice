@@ -3,6 +3,9 @@ import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { logger } from "./lib/logger.js";
 import { checkDatabaseConnection, prisma } from "./lib/prisma.js";
+import { INVENTORY_STOCK_QUEUE, INVENTORY_TOPOLOGY } from "./messaging/inventory-events.js";
+import { RabbitMqConsumer } from "./messaging/rabbitmq.consumer.js";
+import { StockEventConsumer } from "./modules/inventory/inventory.consumer.js";
 import { PrismaInventoryRepository } from "./modules/inventory/inventory.repository.js";
 import { InventoryService } from "./modules/inventory/inventory.service.js";
 
@@ -10,18 +13,49 @@ import { InventoryService } from "./modules/inventory/inventory.service.js";
 function buildServer() {
   const inventoryRepository = new PrismaInventoryRepository(prisma);
   const inventoryService = new InventoryService(inventoryRepository);
+  const consumer = buildConsumer(inventoryService);
 
-  return createApp({
+  const app = createApp({
     inventoryService,
     checkReadiness: () => checkDatabaseConnection(prisma),
+    ...(consumer ? { brokerStatus: () => consumer.status() } : {}),
+  });
+
+  return { app, consumer };
+}
+
+/**
+ * The broker-facing entry point, beside the HTTP one. Same service, same
+ * transactions, same strictness; only the transport differs. Absent unless
+ * RABBITMQ_URL is set.
+ */
+function buildConsumer(inventoryService: InventoryService): RabbitMqConsumer | null {
+  if (!env.RABBITMQ_URL) return null;
+
+  const events = new StockEventConsumer(inventoryService, logger);
+
+  return new RabbitMqConsumer({
+    url: env.RABBITMQ_URL,
+    queue: INVENTORY_STOCK_QUEUE,
+    topology: INVENTORY_TOPOLOGY,
+    handler: (message) => events.handle(message),
+    logger,
+    connectionName: `${env.SERVICE_NAME}:consumer`,
+    prefetch: env.RABBITMQ_PREFETCH,
+    heartbeatSeconds: env.RABBITMQ_HEARTBEAT_SECONDS,
+    connectTimeoutMs: env.RABBITMQ_CONNECT_TIMEOUT_MS,
+    maxRetryDelayMs: env.RABBITMQ_MAX_RETRY_DELAY_MS,
+    requeueDelayMs: env.RABBITMQ_REQUEUE_DELAY_MS,
   });
 }
 
 /**
- * Drains in-flight requests, then closes the database pool. If either stalls,
+ * Drains in-flight requests, stops taking deliveries and lets the handlers
+ * already running settle, then closes the database pool — in that order,
+ * because a handler mid-flight still needs the database. If any step stalls,
  * the timeout forces exit so a stuck connection can't block a rolling deploy.
  */
-function registerShutdownHandlers(server: Server): void {
+function registerShutdownHandlers(server: Server, consumer: RabbitMqConsumer | null): void {
   let shuttingDown = false;
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -40,6 +74,7 @@ function registerShutdownHandlers(server: Server): void {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
+      await consumer?.stop();
       await prisma.$disconnect();
       logger.info("shutdown_complete");
       clearTimeout(forceExit);
@@ -67,8 +102,20 @@ function registerShutdownHandlers(server: Server): void {
   });
 }
 
-function start(): void {
-  const app = buildServer();
+async function start(): Promise<void> {
+  const { app, consumer } = buildServer();
+
+  // Before listening, so a broker this service cannot reach fails the boot
+  // with a clear error rather than a port that answers and a queue nobody
+  // drains. Later losses reconnect on their own.
+  if (consumer) {
+    try {
+      await consumer.start();
+    } catch (error) {
+      logger.fatal({ err: error }, "broker_consumer_start_failed");
+      process.exit(1);
+    }
+  }
 
   const server = app.listen(env.PORT, env.HOST, () => {
     logger.info(
@@ -82,7 +129,7 @@ function start(): void {
     process.exit(1);
   });
 
-  registerShutdownHandlers(server);
+  registerShutdownHandlers(server, consumer);
 }
 
-start();
+void start();

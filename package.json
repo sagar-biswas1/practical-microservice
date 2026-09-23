@@ -21,6 +21,11 @@
     "redis:down": "docker compose down",
     "redis:logs": "docker compose logs -f redis",
     "redis:cli": "docker compose exec redis redis-cli",
+    "rabbitmq:up": "docker compose up -d rabbitmq",
+    "rabbitmq:logs": "docker compose logs -f rabbitmq",
+    "rabbitmq:cli": "docker compose exec rabbitmq rabbitmqctl",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
     "clean": "pnpm -r exec rm -rf dist node_modules/.cache && rm -rf node_modules"
   }
 }
