@@ -190,7 +190,7 @@ export const openapiDocument: OpenApiDocument = {
           in: "path",
           required: true,
           description:
-            "Anything under a registered prefix — `auth/…`, `users/…`, `products/…`, `inventory/…`, `emails/…`.",
+            "Anything under a registered prefix — `auth/…`, `users/…`, `products/…`, `inventory/…`, `emails/…`, `cart/…`.",
           schema: { type: "string" },
         },
       ],

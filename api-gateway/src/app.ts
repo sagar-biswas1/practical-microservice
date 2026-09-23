@@ -17,7 +17,7 @@ export interface AppDependencies extends RouterDependencies {
   /**
    * Edge policies and upstream proxies, flattened into one chain in match
    * order. Injected so tests can stand in fake handlers instead of running the
-   * five upstream services.
+   * upstream services.
    */
   upstreamHandlers?: RequestHandler[];
 }
@@ -42,7 +42,9 @@ export function createApp(deps: AppDependencies = {}): Express {
     cors({
       origin: corsOrigins,
       credentials: true,
-      exposedHeaders: [REQUEST_ID_HEADER],
+      // `cart-session-id` is how an anonymous shopper finds their cart again;
+      // without exposing it a browser client can never read the id it was given.
+      exposedHeaders: [REQUEST_ID_HEADER, "cart-session-id"],
     }),
   );
 

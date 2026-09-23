@@ -156,4 +156,23 @@ export const routePolicies: Record<ServiceName, readonly RoutePolicy[]> = {
       handlers: adminOnly,
     },
   ],
+
+  /**
+   * Carts are anonymous: a shopper is identified by the `cart-session-id`
+   * header the service hands out, not by a token, so building, reading and
+   * abandoning a cart stay open.
+   *
+   * Checkout is the exception. It names an order that must already exist and
+   * hands the cart's stock hold over to it — the order service's call, made
+   * directly, never a browser's. Closed here for the same reason inventory's
+   * stock mutations are.
+   */
+  cart: [
+    {
+      name: "cart-checkout",
+      methods: ["POST"],
+      paths: ["/checkout"],
+      handlers: adminOnly,
+    },
+  ],
 };

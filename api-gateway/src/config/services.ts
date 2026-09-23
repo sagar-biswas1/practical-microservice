@@ -15,7 +15,7 @@ export const API_PREFIX = "/api/v1";
  * its edge policy has been declared. "Which routes need a token?" becomes a
  * question you cannot forget to answer.
  */
-export type ServiceName = "auth" | "user" | "product" | "inventory" | "email";
+export type ServiceName = "auth" | "user" | "product" | "inventory" | "email" | "cart";
 
 export interface ServiceRoute {
   /** Registry key. Appears in logs and in the `/health/ready` payload. */
@@ -30,6 +30,11 @@ export interface ServiceRoute {
   target: string;
   /** Liveness probe path, relative to `target`, used by readiness checks. */
   healthPath: string;
+  /**
+   * Whether the upstream serves `/openapi.json` for the docs picker. Defaults
+   * to true; a service without one would otherwise show up as a broken entry.
+   */
+  hasDocs?: boolean;
 }
 
 /**
@@ -70,5 +75,13 @@ export const serviceRegistry: readonly ServiceRoute[] = [
     prefix: `${API_PREFIX}/emails`,
     target: env.EMAIL_SERVICE_URL,
     healthPath: `${API_PREFIX}/health/live`,
+  },
+  {
+    name: "cart",
+    prefix: `${API_PREFIX}/cart`,
+    target: env.CART_SERVICE_URL,
+    healthPath: `${API_PREFIX}/health/live`,
+    // A NestJS service with no generated OpenAPI document yet.
+    hasDocs: false,
   },
 ];

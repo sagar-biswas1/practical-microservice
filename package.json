@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "pnpm -r --parallel dev",
+    "start:all": "bash scripts/start-all.sh",
     "build": "pnpm -r build",
     "start": "pnpm -r --parallel start",
     "test": "pnpm -r test",

@@ -26,6 +26,7 @@ describe("gateway surface", () => {
         { name: "product", prefix: `${API_PREFIX}/products` },
         { name: "inventory", prefix: `${API_PREFIX}/inventory` },
         { name: "email", prefix: `${API_PREFIX}/emails` },
+        { name: "cart", prefix: `${API_PREFIX}/cart` },
       ]);
     });
   });

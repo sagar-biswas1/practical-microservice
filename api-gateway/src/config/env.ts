@@ -35,6 +35,7 @@ const envSchema = z.object({
   USER_SERVICE_URL: upstreamUrl("http://localhost:4003"),
   EMAIL_SERVICE_URL: upstreamUrl("http://localhost:4004"),
   AUTH_SERVICE_URL: upstreamUrl("http://localhost:4005"),
+  CART_SERVICE_URL: upstreamUrl("http://localhost:4006"),
 
   /**
    * Verification key for the access tokens the auth service mints. It must be

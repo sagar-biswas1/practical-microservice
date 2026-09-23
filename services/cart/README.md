@@ -71,7 +71,7 @@ later loss is retried forever with a capped backoff, and publishes issued in
 the meantime wait for the reconnect rather than failing straight away.
 
 Setting `RABBITMQ_URL` turns the module on. Unset, nothing here opens a socket
-and `GET /health/ready` reports `broker: { enabled: false }`. The broker is
+and `GET /api/v1/health/ready` reports `broker: { enabled: false }`. The broker is
 reported by readiness but does not gate it — losing it only delays releases,
 which the sweeper retries.
 

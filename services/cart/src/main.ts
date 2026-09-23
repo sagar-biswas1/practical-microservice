@@ -37,6 +37,10 @@ async function bootstrap() {
   // so connections close instead of being cut off with the process.
   app.enableShutdownHooks();
 
+  // The same prefix every other service mounts, so the gateway can forward
+  // `/api/v1/cart/*` path-for-path without rewriting.
+  app.setGlobalPrefix('api/v1');
+
   // Without this the DTOs' decorators are inert: `quantity` arrives as
   // whatever JSON held, and the cart's delta arithmetic is only sound for
   // whole numbers. `transform` is what turns the plain body into CartItemDto

@@ -27,10 +27,12 @@ interface Definition {
 export function definitions(): Definition[] {
   return [
     { name: `${env.SERVICE_NAME} (this gateway)`, url: OPENAPI_PATH },
-    ...serviceRegistry.map(({ name, target }) => ({
-      name: `${name} service`,
-      url: `${target}${OPENAPI_PATH}`,
-    })),
+    ...serviceRegistry
+      .filter(({ hasDocs }) => hasDocs !== false)
+      .map(({ name, target }) => ({
+        name: `${name} service`,
+        url: `${target}${OPENAPI_PATH}`,
+      })),
   ];
 }
 

@@ -11,6 +11,7 @@ TypeScript, Express 5, Prisma 6 (PostgreSQL), and Zod 4.
 | `user`        | `4003` | User profiles                          | `http://localhost:4003/api/v1` |
 | `email`       | `4004` | Transactional outbox + mail delivery   | `http://localhost:4004/api/v1` |
 | `auth`        | `4005` | Logins, sessions, verification codes   | `http://localhost:4005/api/v1` |
+| `cart`        | `4006` | Anonymous carts + stock holds (Redis)  | `http://localhost:4006/api/v1` |
 
 The product service calls the inventory service over HTTP — it provisions a stock record for
 every product it creates and enriches its reads with stock levels. See
@@ -727,7 +728,7 @@ What it does at the edge, that no individual service should have to:
 
 | Concern           | Behaviour                                                                     |
 | ----------------- | ----------------------------------------------------------------------------- |
-| Routing           | `/auth` → `:4005`, `/users` → `:4003`, `/products` → `:4001`, `/inventory` → `:4002`, `/emails` → `:4004`, path-for-path |
+| Routing           | `/auth` → `:4005`, `/users` → `:4003`, `/products` → `:4001`, `/inventory` → `:4002`, `/emails` → `:4004`, `/cart` → `:4006`, path-for-path |
 | Correlation       | Mints `x-request-id` (honouring an inbound one) and forwards it upstream       |
 | Authentication    | Verifies the access token on protected routes; `401` before the upstream is called |
 | Authorisation     | Coarse role check (`ADMIN`) on writes and operational surfaces                 |
@@ -788,6 +789,7 @@ routes need a token?" becomes a question you cannot skip.
 | `/api/v1/products`    | all reads                             | —                                                     | create, update, delete                    |
 | `/api/v1/inventory`   | —                                     | all reads                                             | writes and every stock transition         |
 | `/api/v1/emails`      | —                                     | —                                                     | the entire surface                        |
+| `/api/v1/cart`        | set items, read, abandon (by `cart-session-id`) | —                                  | `POST /checkout`                          |
 
 `/logout` and `/refresh` stay public deliberately: both authenticate with the refresh token in
 the body, and both are needed exactly when the access token has expired. Requiring one would

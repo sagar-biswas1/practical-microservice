@@ -313,6 +313,45 @@ describe("edge route policies", () => {
     });
   });
 
+  describe("cart service", () => {
+    const PREFIX = `${API_PREFIX}/cart`;
+    let app: Express;
+
+    beforeEach(() => {
+      app = appFor("cart", PREFIX, upstream.url);
+    });
+
+    it("keeps the anonymous cart open, session header intact", async () => {
+      await request(app)
+        .post(PREFIX)
+        .set("cart-session-id", "s-1")
+        .send({ items: [{ productId: "p1", quantity: 2 }] })
+        .expect(200);
+      await request(app).get(PREFIX).set("cart-session-id", "s-1").expect(200);
+      await request(app).delete(PREFIX).set("cart-session-id", "s-1").expect(200);
+
+      expect(upstream.received).toHaveLength(3);
+      expect(upstream.received[0]?.headers["cart-session-id"]).toBe("s-1");
+    });
+
+    it("closes checkout to anyone but an admin", async () => {
+      await request(app).post(`${PREFIX}/checkout`).expect(401);
+      await request(app)
+        .post(`${PREFIX}/checkout`)
+        .set("authorization", await bearer({ role: "USER" }))
+        .expect(403);
+
+      expect(upstream.received).toHaveLength(0);
+
+      await request(app)
+        .post(`${PREFIX}/checkout`)
+        .set("authorization", await bearer({ role: "ADMIN" }))
+        .expect(200);
+
+      expect(upstream.received).toHaveLength(1);
+    });
+  });
+
   describe("paths no policy covers", () => {
     it("still 404s rather than being caught by a neighbouring policy", async () => {
       const app = appFor("product", `${API_PREFIX}/products`, upstream.url);
