@@ -23,76 +23,90 @@
 
 ## Description
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+The cart service: shopper carts in Redis, with stock held in the inventory
+service for as long as a cart lives and handed back when it expires.
 
-## Project setup
+## Talking to other services
+
+Two kinds of call leave this service, and they travel differently.
+
+**Request/response** — reserving stock, moving a hold to an order at checkout,
+looking up stock levels. A shopper is waiting on the answer, so these go over
+HTTP to the inventory service (`INVENTORY_SERVICE_URL`) and always will. They
+live behind `INVENTORY_PORT` in `src/inventory/inventory.port.ts`.
+
+**Fire-and-forget** — releasing stock when a cart expires, is abandoned, or a
+checkout falls through. Nobody is waiting, so these live behind a second port,
+`INVENTORY_DISPATCH`, whose transport is a config value:
+
+| `INVENTORY_DISPATCH_TRANSPORT` | What happens on a release                                          |
+| ------------------------------ | ------------------------------------------------------------------ |
+| `http` (default)               | `POST /api/v1/inventory/bulk/release`, same as everything else     |
+| `amqp`                         | A message on RabbitMQ, confirmed by the broker before we move on   |
+
+Splitting the two into separate interfaces is what makes the switch safe: a
+transport cannot make a reservation fire-and-forget, because the method is not
+on the interface it implements.
+
+### RabbitMQ
+
+`src/messaging/` owns the connection. `RabbitMqClient` is this service's one
+connection to the broker as a publisher — a single confirm channel, shared by
+every adapter that publishes. It promises three things:
+
+1. `publish` resolves only once the broker has **confirmed** the message. A
+   resolved promise is the caller's licence to delete its own record of what
+   was sent (the cart), so resolving on a mere socket write would turn a
+   broker hiccup into stock that is reserved forever.
+2. `publish` never hangs: it resolves or rejects with `BrokerUnavailableError`
+   within `RABBITMQ_PUBLISH_TIMEOUT_MS`. The inventory adapter turns that into
+   `ServiceUnavailableException`, the same error a failed HTTP call raises, so
+   the cart's sweeper retries the release exactly as it does today.
+3. Topology registered through `registerTopology` exists on the broker before
+   the first publish and is declared again after every reconnect.
+
+Connection loss is handled once, here: the first connection at boot is allowed
+to fail the process (a wrong URL surfaces at bootstrap, as with Redis); every
+later loss is retried forever with a capped backoff, and publishes issued in
+the meantime wait for the reconnect rather than failing straight away.
+
+Setting `RABBITMQ_URL` turns the module on. Unset, nothing here opens a socket
+and `GET /health/ready` reports `broker: { enabled: false }`. The broker is
+reported by readiness but does not gate it — losing it only delays releases,
+which the sweeper retries.
 
 ```bash
-$ pnpm install
+pnpm rabbitmq:up                        # from the repo root; UI at :15672, guest/guest
+echo 'RABBITMQ_URL=amqp://guest:guest@localhost:5672' >> .env
+echo 'INVENTORY_DISPATCH_TRANSPORT=amqp' >> .env
+pnpm dev
 ```
 
-## Compile and run the project
+### The wire contract
 
-```bash
-# development
-$ pnpm run start
+`src/inventory/inventory.messages.ts` is the whole of it, and the file the
+inventory service should copy (or import) when it grows a consumer:
 
-# watch mode
-$ pnpm run start:dev
+- Exchange `inventory`, topic, durable. Routing keys `inventory.stock.release`
+  (published here), `inventory.stock.fulfil` and `inventory.stock.return` (to
+  be published by the order service).
+- Queue `inventory.stock`, durable, bound to `inventory.stock.*`, dead-lettering
+  to the fanout exchange `inventory.dlx` and from there to `inventory.stock.dead`.
+  Declared by this publisher as well as the consumer, on purpose: a topic
+  exchange with no bound queue drops messages *and confirms them*, so without
+  this every release published before inventory's consumer first ran would be
+  lost. Both sides must declare it identically or RabbitMQ closes the channel
+  with `PRECONDITION_FAILED`; the other copy is
+  `services/inventory/src/messaging/inventory-events.ts`.
+- Every message is persistent JSON with a `messageId`, also set as the AMQP
+  `messageId` property. Delivery is at-least-once and stock transitions are
+  not idempotent, so **the consumer must dedupe on `messageId`**.
+- `correlationId` carries the same request id the HTTP path sends as
+  `x-request-id`; `actor` the same identity as `x-actor-id`.
 
-# production mode
-$ pnpm run start:prod
-```
-
-## Run tests
-
-```bash
-# unit tests
-$ pnpm run test
-
-# e2e tests
-$ pnpm run test:e2e
-
-# test coverage
-$ pnpm run test:cov
-```
-
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ pnpm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+The consumer lives in the inventory service (`src/modules/inventory/inventory.consumer.ts`
+there) and runs when that service has `RABBITMQ_URL` set. It applies a release through
+the same service method as the HTTP bulk endpoint, dedupes on `messageId` inside the same
+database transaction as the stock change, acks on success or on a duplicate, dead-letters a
+release inventory refuses or a message it cannot parse, and requeues after a pause when the
+database is the problem.

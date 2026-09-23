@@ -97,3 +97,22 @@ model StockMovementHistory {
   @@index([itemId, createdAt])
   @@map("stock_movement_histories")
 }
+
+/// Idempotency ledger for the stock-event consumer (see src/messaging).
+///
+/// Delivery from RabbitMQ is at-least-once and stock transitions are not
+/// idempotent, so every consumed message's id is written here *inside the
+/// same transaction* as the stock change it caused. A redelivery then fails
+/// on the primary key before touching stock, and a crash between "applied"
+/// and "recorded" is impossible because they are one commit.
+model ProcessedMessage {
+  messageId   String   @id @map("message_id") @db.VarChar(120)
+  /// Routing key the message arrived under, e.g. `inventory.stock.release`.
+  type        String   @db.VarChar(120)
+  /// The cart or order the change was for, for reconciling against the ledger.
+  reference   String?  @db.VarChar(120)
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  @@index([processedAt])
+  @@map("processed_messages")
+}

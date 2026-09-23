@@ -7,11 +7,12 @@ import { env } from './config/env';
 /**
  * Leaves the process no way to linger.
  *
- * Both Redis connections keep the event loop alive on their own, so a process
- * that stops serving does not exit by itself — it just sits there holding the
- * port. Under `nest start --watch` that is fatal: the watcher spawns a
- * replacement on every save, the replacement cannot bind, and the corpse from
- * the *first* failure keeps serving stale code for the rest of the session.
+ * Both Redis connections — and the RabbitMQ one, when configured — keep the
+ * event loop alive on their own, so a process that stops serving does not
+ * exit by itself — it just sits there holding the port. Under
+ * `nest start --watch` that is fatal: the watcher spawns a replacement on
+ * every save, the replacement cannot bind, and the corpse from the *first*
+ * failure keeps serving stale code for the rest of the session.
  * So every exit path here ends in an explicit process.exit, and app.close()
  * gets a deadline it cannot overrun.
  */
@@ -32,8 +33,8 @@ async function shutdown(app: INestApplication, code: number): Promise<never> {
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-  // Required for RedisService.onApplicationShutdown to run, so connections
-  // close instead of being cut off with the process.
+  // Required for the Redis and RabbitMQ onApplicationShutdown hooks to run,
+  // so connections close instead of being cut off with the process.
   app.enableShutdownHooks();
 
   // Without this the DTOs' decorators are inert: `quantity` arrives as

@@ -18,6 +18,7 @@ import {
 } from "./inventory.rules.js";
 import type { StockLevels } from "./inventory.rules.js";
 import type {
+  BulkStockChangeOptions,
   BulkStockChangePlan,
   InventoryAuditLog,
   InventoryItem,
@@ -186,9 +187,16 @@ export class InventoryService {
    * release that already succeeded gets a 409 — the per-line `code` in the
    * error details is what tells it the difference between "already released"
    * and "never reserved".
+   *
+   * `options.idempotencyKey` is for callers that cannot tell a retry from a
+   * first attempt — the broker consumer. With it, a repeat is refused with
+   * `DuplicateOperationError` before it can touch stock.
    */
-  releaseMany(input: BulkReleaseStockInput): Promise<InventoryItemView[]> {
-    return this.applyBulkChange("RELEASE", "released", input, planRelease);
+  releaseMany(
+    input: BulkReleaseStockInput,
+    options: BulkStockChangeOptions = {},
+  ): Promise<InventoryItemView[]> {
+    return this.applyBulkChange("RELEASE", "released", input, planRelease, options);
   }
 
   /**
@@ -204,6 +212,7 @@ export class InventoryService {
     action: string,
     input: BulkReserveStockInput,
     plan: (item: StockLevels, quantity: number) => StockLevels,
+    options: BulkStockChangeOptions = {},
   ): Promise<InventoryItemView[]> {
     const updated = await this.repository.applyBulkStockChange(
       input.items.map((line) => line.productId),
@@ -263,6 +272,7 @@ export class InventoryService {
 
         return plans;
       },
+      options,
     );
 
     return updated.map(toInventoryItemView);

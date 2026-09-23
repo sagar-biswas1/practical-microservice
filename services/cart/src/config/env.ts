@@ -26,7 +26,7 @@ const booleanFlag = z
   .enum(['true', 'false'])
   .transform((value) => value === 'true');
 
-const envSchema = z.object({
+const baseEnvSchema = z.object({
   NODE_ENV: z
     .enum(['development', 'test', 'production'])
     .default('development'),
@@ -59,15 +59,59 @@ const envSchema = z.object({
    * checkout transfer have a caller waiting on the answer, so they stay
    * request/response whatever this says. See `inventory.port.ts`.
    *
-   * `amqp` needs `AmqpInventoryDispatch.publish` finished first; the module
-   * refuses to start otherwise rather than dropping releases on the floor.
+   * `amqp` requires RABBITMQ_URL, and a consumer on the inventory side that
+   * drains the `inventory.stock` queue — until one exists, releases published
+   * this way sit in the queue rather than being applied.
    */
   INVENTORY_DISPATCH_TRANSPORT: z.enum(['http', 'amqp']).default('http'),
-  /** Unused while the transport is `http`. */
+  /**
+   * Setting this turns messaging on: the service connects at boot and
+   * refuses to start if it cannot, exactly as it does for Redis. Leave it
+   * unset and nothing in this service opens a socket to a broker.
+   * Required while `INVENTORY_DISPATCH_TRANSPORT` is `amqp`.
+   *
+   * A `?heartbeat=` query on the URL overrides RABBITMQ_HEARTBEAT_SECONDS.
+   */
   RABBITMQ_URL: optionalString.refine(
     (value) => value === undefined || /^amqps?:\/\//.test(value),
     'RABBITMQ_URL must start with amqp:// or amqps://',
   ),
+  /**
+   * How often client and broker prove the connection is still alive. Without
+   * one, a half-open TCP connection is only discovered by the next publish,
+   * which then hangs for the whole publish timeout. `0` disables heartbeats.
+   */
+  RABBITMQ_HEARTBEAT_SECONDS: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .max(3_600)
+    .default(30),
+  /** Budget for establishing the TCP+AMQP connection, at boot and on reconnect. */
+  RABBITMQ_CONNECT_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(60_000)
+    .default(10_000),
+  /** Cap on the backoff between reconnect attempts; see REDIS_MAX_RETRY_DELAY_MS. */
+  RABBITMQ_MAX_RETRY_DELAY_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(60_000)
+    .default(5_000),
+  /**
+   * How long one publish may take end to end — waiting for a connection if
+   * there is none, then for the broker's confirm. A release that overruns
+   * this is rejected and retried by the sweeper, like a failed HTTP call.
+   */
+  RABBITMQ_PUBLISH_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(30_000)
+    .default(5_000),
 
   /**
    * Full connection string. When set it wins over the discrete REDIS_* fields
@@ -188,6 +232,21 @@ const envSchema = z.object({
     .positive()
     .max(600_000)
     .default(30_000),
+});
+
+/**
+ * Cross-field rules, which a per-field schema cannot express. Kept beside
+ * the schema so `Env` still infers from one place.
+ */
+const envSchema = baseEnvSchema.superRefine((value, ctx) => {
+  if (value.INVENTORY_DISPATCH_TRANSPORT === 'amqp' && !value.RABBITMQ_URL) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['RABBITMQ_URL'],
+      message:
+        'RABBITMQ_URL is required while INVENTORY_DISPATCH_TRANSPORT=amqp',
+    });
+  }
 });
 
 export type Env = z.infer<typeof envSchema>;

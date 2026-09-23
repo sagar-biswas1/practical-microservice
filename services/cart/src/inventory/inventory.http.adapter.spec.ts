@@ -5,6 +5,7 @@ import {
 import { Test } from '@nestjs/testing';
 import type { AxiosInstance, AxiosResponse } from 'axios';
 
+import { RabbitMqClient } from '../messaging/rabbitmq.client';
 import { InsufficientStockException } from './insufficient-stock.exception';
 import { HttpInventoryAdapter } from './inventory.http.adapter';
 import { INVENTORY_HTTP } from './inventory.constants';
@@ -12,6 +13,21 @@ import { InventoryModule } from './inventory.module';
 import { AmqpInventoryDispatch } from './inventory.amqp.adapter';
 import { INVENTORY_DISPATCH, INVENTORY_PORT } from './inventory.port';
 import type { InventoryItem, StockLine } from './inventory.types';
+
+/**
+ * `InventoryModule` imports `MessagingModule`, whose factory would connect to
+ * whatever `RABBITMQ_URL` names. Stubbing the client keeps these tests off the
+ * network whatever the developer's .env says; the client has its own spec.
+ */
+const compileInventoryModule = () =>
+  Test.createTestingModule({ imports: [InventoryModule] })
+    .overrideProvider(RabbitMqClient)
+    .useValue({
+      registerTopology: jest.fn().mockResolvedValue(undefined),
+      publish: jest.fn(),
+      status: () => ({ enabled: false, connected: false }),
+    })
+    .compile();
 
 type RequestConfig = { method: string; url: string; data?: unknown };
 
@@ -57,9 +73,7 @@ describe('HttpInventoryAdapter', () => {
     // constructor Nest cannot satisfy still passed a green suite. This one
     // resolves it through the container, the way the app does at boot.
     it('resolves from InventoryModule', async () => {
-      const module = await Test.createTestingModule({
-        imports: [InventoryModule],
-      }).compile();
+      const module = await compileInventoryModule();
 
       expect(module.get(HttpInventoryAdapter)).toBeInstanceOf(
         HttpInventoryAdapter,
@@ -68,9 +82,7 @@ describe('HttpInventoryAdapter', () => {
     });
 
     it('serves both ports from one instance while dispatch is HTTP', async () => {
-      const module = await Test.createTestingModule({
-        imports: [InventoryModule],
-      }).compile();
+      const module = await compileInventoryModule();
 
       const adapter = module.get(HttpInventoryAdapter);
 
@@ -83,9 +95,7 @@ describe('HttpInventoryAdapter', () => {
     });
 
     it('keeps the AMQP dispatch out of the way until it is selected', async () => {
-      const module = await Test.createTestingModule({
-        imports: [InventoryModule],
-      }).compile();
+      const module = await compileInventoryModule();
 
       // Constructed, so a wiring mistake surfaces at boot rather than on the
       // first expiry after the transport is flipped — but not wired in.
@@ -268,20 +278,6 @@ describe('HttpInventoryAdapter', () => {
       );
 
       expect(calls).toHaveLength(0);
-    });
-  });
-
-  describe('AmqpInventoryDispatch', () => {
-    it('refuses to pretend it published, so a release is never silently lost', async () => {
-      await expect(
-        new AmqpInventoryDispatch().releaseMany(LINES, 'cart_1'),
-      ).rejects.toThrow('not implemented');
-    });
-
-    it('is a no-op for an empty batch, like the HTTP adapter', async () => {
-      await expect(
-        new AmqpInventoryDispatch().releaseMany([], 'cart_1'),
-      ).resolves.toBeUndefined();
     });
   });
 

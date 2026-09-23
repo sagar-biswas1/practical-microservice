@@ -5,7 +5,11 @@ import type {
   StockMovementHistory,
 } from "../../generated/prisma/client.js";
 import type { PrismaClient } from "../../lib/prisma.js";
-import { InternalServerError, NotFoundError } from "../../errors/app-error.js";
+import {
+  DuplicateOperationError,
+  InternalServerError,
+  NotFoundError,
+} from "../../errors/app-error.js";
 import { AUDITED_FIELDS } from "./inventory.schema.js";
 import type {
   CreateInventoryItemInput,
@@ -110,6 +114,29 @@ export type BulkStockChangePlanner = (
   items: Map<string, InventoryItem>,
 ) => BulkStockChangePlan[];
 
+/**
+ * Identifies one application of a bulk change, so a repeat is refused.
+ *
+ * Recorded in the same transaction as the change itself: either both commit
+ * or neither does, which is the only way "applied exactly once" survives a
+ * crash between the two. Needed by the broker consumer, where delivery is
+ * at-least-once; the HTTP path has no such key because its caller is told
+ * the outcome directly.
+ */
+export interface IdempotencyKey {
+  /** Unique per attempt — a message id. */
+  messageId: string;
+  /** What kind of operation, e.g. a routing key. */
+  type: string;
+  /** What it was for — a cart or order — for reconciling against the ledger. */
+  reference?: string | undefined;
+}
+
+export interface BulkStockChangeOptions {
+  /** When set, a second call with the same key throws `DuplicateOperationError`. */
+  idempotencyKey?: IdempotencyKey | undefined;
+}
+
 export interface InventoryRepository {
   list(query: ListInventoryQuery): Promise<Paginated<InventoryItem>>;
   findById(id: string): Promise<InventoryItem | null>;
@@ -145,6 +172,7 @@ export interface InventoryRepository {
   applyBulkStockChange(
     productIds: string[],
     plan: BulkStockChangePlanner,
+    options?: BulkStockChangeOptions,
   ): Promise<InventoryItem[]>;
 }
 
@@ -371,9 +399,31 @@ export class PrismaInventoryRepository implements InventoryRepository {
   applyBulkStockChange(
     productIds: string[],
     plan: BulkStockChangePlanner,
+    options: BulkStockChangeOptions = {},
   ): Promise<InventoryItem[]> {
     return this.prisma.$transaction(
       async (tx) => {
+        // The idempotency claim goes first, inside the transaction: a repeat
+        // fails here on the primary key before a single row is read, and a
+        // batch the planner rejects rolls the claim back with everything
+        // else, so a later retry of that same message is not mistaken for a
+        // duplicate of something that never happened.
+        if (options.idempotencyKey) {
+          const key = options.idempotencyKey;
+          try {
+            await tx.processedMessage.create({
+              data: {
+                messageId: key.messageId,
+                type: key.type,
+                reference: key.reference ?? null,
+              },
+            });
+          } catch (error) {
+            if (isUniqueViolation(error)) throw new DuplicateOperationError(key.messageId);
+            throw error;
+          }
+        }
+
         const current = await tx.inventoryItem.findMany({
           where: { productId: { in: productIds } },
         });
@@ -437,4 +487,17 @@ export class PrismaInventoryRepository implements InventoryRepository {
       },
     );
   }
+}
+
+/**
+ * Prisma's unique-constraint failure, matched by code rather than class so
+ * this file does not have to import the generated error types.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code: unknown }).code === "P2002"
+  );
 }

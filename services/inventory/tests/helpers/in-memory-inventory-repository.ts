@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type {
+  BulkStockChangeOptions,
   BulkStockChangePlanner,
   InventoryAuditLog,
   InventoryItem,
@@ -10,7 +11,7 @@ import type {
   UpdateContext,
 } from "../../src/modules/inventory/inventory.repository.js";
 import { diffInventoryItem } from "../../src/modules/inventory/inventory.repository.js";
-import { NotFoundError } from "../../src/errors/app-error.js";
+import { DuplicateOperationError, NotFoundError } from "../../src/errors/app-error.js";
 import type {
   CreateInventoryItemInput,
   ListAuditLogsQuery,
@@ -28,6 +29,7 @@ export class InMemoryInventoryRepository implements InventoryRepository {
   private readonly items = new Map<string, InventoryItem>();
   private readonly movements: StockMovementHistory[] = [];
   private readonly auditLogs: InventoryAuditLog[] = [];
+  private readonly processedMessages = new Set<string>();
 
   constructor(seed: InventoryItem[] = []) {
     for (const item of seed) this.items.set(item.id, item);
@@ -204,7 +206,15 @@ export class InMemoryInventoryRepository implements InventoryRepository {
   async applyBulkStockChange(
     productIds: string[],
     plan: BulkStockChangePlanner,
+    options: BulkStockChangeOptions = {},
   ): Promise<InventoryItem[]> {
+    // Mirrors the transaction: a repeat is refused before anything is read,
+    // and the key is only remembered once the whole batch has been applied.
+    const key = options.idempotencyKey?.messageId;
+    if (key !== undefined && this.processedMessages.has(key)) {
+      throw new DuplicateOperationError(key);
+    }
+
     const wanted = new Set(productIds);
     const byProductId = new Map(
       [...this.items.values()]
@@ -239,6 +249,7 @@ export class InMemoryInventoryRepository implements InventoryRepository {
       updated.push(item);
     }
 
+    if (key !== undefined) this.processedMessages.add(key);
     return updated;
   }
 
@@ -273,5 +284,9 @@ export class InMemoryInventoryRepository implements InventoryRepository {
 
   get auditLogCount(): number {
     return this.auditLogs.length;
+  }
+
+  get processedMessageCount(): number {
+    return this.processedMessages.size;
   }
 }

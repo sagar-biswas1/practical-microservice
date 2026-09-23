@@ -1,3 +1,4 @@
+import type { MessagingTopology } from '../messaging/messaging.types';
 import type { StockLine } from './inventory.types';
 
 /**
@@ -34,6 +35,69 @@ export const InventoryRoutingKey = {
 
 export type InventoryRoutingKeyValue =
   (typeof InventoryRoutingKey)[keyof typeof InventoryRoutingKey];
+
+/**
+ * The queue inventory consumes stock transitions from, bound to every
+ * `inventory.stock.*` key on the exchange above.
+ *
+ * Declared by the *publisher* as well as the consumer, which is unusual and
+ * deliberate. A topic exchange with no bound queue drops messages on the
+ * floor, silently and with a publisher confirm — so until inventory's
+ * consumer has run at least once, every release the cart published would be
+ * confirmed and lost. Asserting the queue and binding here means a release
+ * published before the consumer exists waits in the queue for it instead.
+ *
+ * The cost is that both sides must declare it identically: RabbitMQ
+ * answers a redeclaration with different options with PRECONDITION_FAILED
+ * and closes the channel. The inventory side is
+ * `services/inventory/src/messaging/inventory-events.ts`; any change to the
+ * options below — the dead-letter exchange, a quorum queue — happens in
+ * both files and ships to both services.
+ */
+export const INVENTORY_STOCK_QUEUE = 'inventory.stock';
+
+/**
+ * Where the consumer sends a message it will never be able to apply —
+ * malformed, an unknown type, or a release inventory refused. A fanout, so
+ * a dead-lettered message lands whatever routing key it carried. Nothing
+ * consumes `inventory.stock.dead`; it is for a person to read.
+ */
+export const INVENTORY_DEAD_LETTER_EXCHANGE = 'inventory.dlx';
+export const INVENTORY_STOCK_DEAD_QUEUE = 'inventory.stock.dead';
+
+/** Everything the exchanges and queues need to look like on the broker. */
+export const INVENTORY_TOPOLOGY: MessagingTopology = {
+  exchanges: [
+    { name: INVENTORY_EXCHANGE, type: 'topic', options: { durable: true } },
+    {
+      name: INVENTORY_DEAD_LETTER_EXCHANGE,
+      type: 'fanout',
+      options: { durable: true },
+    },
+  ],
+  queues: [
+    {
+      name: INVENTORY_STOCK_QUEUE,
+      options: {
+        durable: true,
+        deadLetterExchange: INVENTORY_DEAD_LETTER_EXCHANGE,
+      },
+    },
+    { name: INVENTORY_STOCK_DEAD_QUEUE, options: { durable: true } },
+  ],
+  bindings: [
+    {
+      queue: INVENTORY_STOCK_QUEUE,
+      exchange: INVENTORY_EXCHANGE,
+      pattern: 'inventory.stock.*',
+    },
+    {
+      queue: INVENTORY_STOCK_DEAD_QUEUE,
+      exchange: INVENTORY_DEAD_LETTER_EXCHANGE,
+      pattern: '',
+    },
+  ],
+};
 
 /**
  * The envelope every message carries.

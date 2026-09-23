@@ -2,6 +2,7 @@ import { Module, type Provider } from '@nestjs/common';
 import axios from 'axios';
 
 import { env } from '../config/env';
+import { MessagingModule } from '../messaging/messaging.module';
 import { AmqpInventoryDispatch } from './inventory.amqp.adapter';
 import { INVENTORY_HTTP } from './inventory.constants';
 import { HttpInventoryAdapter } from './inventory.http.adapter';
@@ -53,6 +54,7 @@ const dispatchProvider: Provider = {
  * start holding units it may later have to hand back.
  */
 @Module({
+  imports: [MessagingModule],
   providers: [
     httpProvider,
     HttpInventoryAdapter,
